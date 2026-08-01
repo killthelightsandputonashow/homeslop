@@ -1,4 +1,4 @@
-const CACHE_NAME = "homeslop-shell-v7-shadow-dark";
+const CACHE_NAME = "homeslop-shell-v8-reader-width";
 const APP_SHELL = [
   "./",
   "./index.html",
