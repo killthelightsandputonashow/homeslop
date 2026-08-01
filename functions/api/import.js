@@ -1,6 +1,7 @@
 const AO3_HOST = "archiveofourown.org";
 const AO3_HOSTS = ["archiveofourown.org", "www.archiveofourown.org"];
 const USER_AGENT = "Homeslop/0.1 personal AO3 reader (single user, on-demand imports)";
+const IMPORTER_VERSION = "0.1.3-diag";
 const AO3_TIMEOUT_MS = 15000;
 const RETRYABLE_STATUSES = new Set([
   408,
@@ -19,9 +20,9 @@ const RETRYABLE_STATUSES = new Set([
   530,
 ]);
 
-function jsonError(error, status = 400, extraHeaders = {}) {
+function jsonError(error, status = 400, extraHeaders = {}, diagnostics = null) {
   return Response.json(
-    { error },
+    { error, diagnostics },
     {
       status,
       headers: {
@@ -61,12 +62,90 @@ function sleep(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
-async function requestOnce(url) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), AO3_TIMEOUT_MS);
+function cleanText(value, limit = 120) {
+  return String(value || "")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, limit);
+}
+
+async function summarizeErrorResponse(response) {
+  if (response.ok) return null;
 
   try {
-    return await fetch(url, {
+    const body = await response.clone().text();
+    const titleMatch = body.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+    const title = cleanText(titleMatch?.[1] || "", 100);
+    const excerpt = cleanText(body, 140);
+    return title || excerpt || null;
+  } catch {
+    return null;
+  }
+}
+
+function makeDiagnostics(context, ao3Url) {
+  return {
+    id: crypto.randomUUID(),
+    importerVersion: IMPORTER_VERSION,
+    workerColo: context.request.cf?.colo || "unknown",
+    sourceHost: ao3Url.hostname,
+    startedAt: new Date().toISOString(),
+    totalDurationMs: 0,
+    attempts: [],
+  };
+}
+
+function formatDiagnostics(diagnostics) {
+  const lines = [
+    `diagnostic id: ${diagnostics.id}`,
+    `importer: ${diagnostics.importerVersion}`,
+    `worker colo: ${diagnostics.workerColo}`,
+    `total: ${diagnostics.totalDurationMs}ms`,
+  ];
+
+  diagnostics.attempts.forEach((attempt) => {
+    if (attempt.outcome === "http") {
+      const details = [
+        `HTTP ${attempt.status}`,
+        `${attempt.durationMs}ms`,
+        attempt.cfRay ? `cf-ray ${attempt.cfRay}` : null,
+        attempt.server ? `server ${attempt.server}` : null,
+        attempt.responseNote ? `page “${attempt.responseNote}”` : null,
+      ]
+        .filter(Boolean)
+        .join("; ");
+      lines.push(`attempt ${attempt.number} (${attempt.hostname}): ${details}`);
+    } else {
+      const details = [
+        attempt.timedOut ? "timed out" : attempt.errorName || "fetch error",
+        `${attempt.durationMs}ms`,
+        attempt.errorMessage || null,
+      ]
+        .filter(Boolean)
+        .join("; ");
+      lines.push(`attempt ${attempt.number} (${attempt.hostname}): ${details}`);
+    }
+  });
+
+  return lines.join("\n");
+}
+
+function diagnosticError(message, diagnostics) {
+  return `${message}\n\n${formatDiagnostics(diagnostics)}`;
+}
+
+async function requestOnce(url, number) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), AO3_TIMEOUT_MS);
+  const started = Date.now();
+
+  try {
+    const response = await fetch(url, {
       method: "GET",
       redirect: "follow",
       signal: controller.signal,
@@ -77,12 +156,48 @@ async function requestOnce(url) {
         "User-Agent": USER_AGENT,
       },
     });
+
+    const summary = {
+      number,
+      hostname: url.hostname,
+      outcome: "http",
+      status: response.status,
+      statusText: response.statusText || "",
+      durationMs: Date.now() - started,
+      finalHost: (() => {
+        try {
+          return new URL(response.url).hostname;
+        } catch {
+          return url.hostname;
+        }
+      })(),
+      cfRay: response.headers.get("cf-ray"),
+      server: response.headers.get("server"),
+      contentType: response.headers.get("content-type"),
+      responseNote: await summarizeErrorResponse(response),
+    };
+
+    return { response, summary };
+  } catch (error) {
+    const summary = {
+      number,
+      hostname: url.hostname,
+      outcome: "exception",
+      durationMs: Date.now() - started,
+      timedOut: error instanceof Error && error.name === "AbortError",
+      errorName: error instanceof Error ? error.name : "UnknownError",
+      errorMessage: error instanceof Error ? error.message : String(error),
+    };
+
+    const wrapped = error instanceof Error ? error : new Error(String(error));
+    wrapped.homeslopSummary = summary;
+    throw wrapped;
   } finally {
     clearTimeout(timeout);
   }
 }
 
-async function requestAO3(url) {
+async function requestAO3(url, diagnostics) {
   let lastResponse = null;
   let lastError = null;
   let attempts = 0;
@@ -100,14 +215,26 @@ async function requestAO3(url) {
       }
 
       try {
-        const response = await requestOnce(candidate);
-        lastResponse = response;
+        const result = await requestOnce(candidate, attempts);
+        diagnostics.attempts.push(result.summary);
+        lastResponse = result.response;
         lastError = null;
 
-        if (response.ok || !RETRYABLE_STATUSES.has(response.status)) {
-          return { response, attempts };
+        if (result.response.ok || !RETRYABLE_STATUSES.has(result.response.status)) {
+          return { response: result.response, attempts };
         }
       } catch (error) {
+        diagnostics.attempts.push(
+          error?.homeslopSummary || {
+            number: attempts,
+            hostname,
+            outcome: "exception",
+            durationMs: 0,
+            timedOut: false,
+            errorName: error instanceof Error ? error.name : "UnknownError",
+            errorMessage: error instanceof Error ? error.message : String(error),
+          },
+        );
         lastError = error;
       }
     }
@@ -135,67 +262,125 @@ export async function onRequestGet(context) {
     return jsonError(error instanceof Error ? error.message : "Invalid AO3 URL.");
   }
 
+  const diagnostics = makeDiagnostics(context, ao3Url);
+  const overallStarted = Date.now();
   let response;
   let attempts = 0;
+
   try {
-    const result = await requestAO3(ao3Url);
+    const result = await requestAO3(ao3Url, diagnostics);
     response = result.response;
     attempts = result.attempts;
   } catch (error) {
+    diagnostics.totalDurationMs = Date.now() - overallStarted;
+    console.warn("Homeslop AO3 import failed", diagnostics);
+
     if (error instanceof Error && error.name === "AbortError") {
       return jsonError(
-        "AO3 did not answer after several timed attempts. It may be slow or refusing Cloudflare traffic right now. Try again later.",
+        diagnosticError(
+          "AO3 did not answer after several timed attempts. It may be slow or refusing Cloudflare traffic right now.",
+          diagnostics,
+        ),
         504,
+        { "X-Homeslop-Diagnostic-ID": diagnostics.id },
+        diagnostics,
       );
     }
+
     return jsonError(
-      "Homeslop could not establish a connection to AO3 after several attempts. The app is online, but the AO3 connection path is unavailable right now.",
+      diagnosticError(
+        "Homeslop could not establish a connection to AO3 after several attempts. The Worker is online, but its outbound AO3 connection failed before a usable response arrived.",
+        diagnostics,
+      ),
       502,
+      { "X-Homeslop-Diagnostic-ID": diagnostics.id },
+      diagnostics,
     );
   }
+
+  diagnostics.totalDurationMs = Date.now() - overallStarted;
 
   if (!response.ok) {
     const retryAfter = response.headers.get("retry-after");
     const headers = {
       ...(retryAfter ? { "Retry-After": retryAfter } : {}),
       "X-Homeslop-Attempts": String(attempts),
+      "X-Homeslop-Diagnostic-ID": diagnostics.id,
     };
 
+    console.warn("Homeslop AO3 import received an error response", diagnostics);
+
     if (response.status === 429) {
-      return jsonError("AO3 asked Homeslop to slow down. Wait a while before importing again.", 429, headers);
+      return jsonError(
+        diagnosticError("AO3 asked Homeslop to slow down. Wait a while before importing again.", diagnostics),
+        429,
+        headers,
+        diagnostics,
+      );
     }
 
     if (response.status === 404) {
-      return jsonError("AO3 could not find that work. It may be deleted, hidden, or restricted.", 404, headers);
+      return jsonError(
+        diagnosticError("AO3 could not find that work. It may be deleted, hidden, or restricted.", diagnostics),
+        404,
+        headers,
+        diagnostics,
+      );
     }
 
     if (response.status === 403) {
-      return jsonError("AO3 refused this request. Login-only and restricted works are not supported yet.", 403, headers);
+      return jsonError(
+        diagnosticError("AO3 refused this request. Login-only and restricted works are not supported yet.", diagnostics),
+        403,
+        headers,
+        diagnostics,
+      );
     }
 
     if (response.status === 525) {
       return jsonError(
-        "AO3's Cloudflare connection failed its SSL handshake after several retries (HTTP 525). Homeslop itself is online; try again later.",
+        diagnosticError(
+          "AO3's Cloudflare edge returned HTTP 525. That means the request reached AO3's Cloudflare layer, but that layer could not complete TLS with AO3's origin server.",
+          diagnostics,
+        ),
         502,
         headers,
+        diagnostics,
       );
     }
 
-    return jsonError(`AO3 returned HTTP ${response.status} after ${attempts} attempts.`, 502, headers);
+    return jsonError(
+      diagnosticError(`AO3 returned HTTP ${response.status} after ${attempts} attempts.`, diagnostics),
+      502,
+      headers,
+      diagnostics,
+    );
   }
 
   const contentType = response.headers.get("content-type") || "";
   if (!contentType.includes("text/html") && !contentType.includes("application/xhtml+xml")) {
-    return jsonError("AO3 returned an unexpected file type.", 502, {
-      "X-Homeslop-Attempts": String(attempts),
-    });
+    return jsonError(
+      diagnosticError("AO3 returned an unexpected file type.", diagnostics),
+      502,
+      {
+        "X-Homeslop-Attempts": String(attempts),
+        "X-Homeslop-Diagnostic-ID": diagnostics.id,
+      },
+      diagnostics,
+    );
   }
 
   const html = await response.text();
   if (!html.includes('id="workskin"') && !html.includes("id='workskin'")) {
-    return jsonError("The AO3 response did not contain a readable work body.", 422, {
-      "X-Homeslop-Attempts": String(attempts),
-    });
+    return jsonError(
+      diagnosticError("The AO3 response did not contain a readable work body.", diagnostics),
+      422,
+      {
+        "X-Homeslop-Attempts": String(attempts),
+        "X-Homeslop-Diagnostic-ID": diagnostics.id,
+      },
+      diagnostics,
+    );
   }
 
   return new Response(html, {
@@ -206,6 +391,7 @@ export async function onRequestGet(context) {
       "X-Content-Type-Options": "nosniff",
       "Referrer-Policy": "no-referrer",
       "X-Homeslop-Attempts": String(attempts),
+      "X-Homeslop-Diagnostic-ID": diagnostics.id,
     },
   });
 }
