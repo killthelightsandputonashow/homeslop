@@ -1,0 +1,4 @@
+/* Author styles can accidentally override the browser's built-in [hidden] rule. */
+[hidden] {
+  display: none !important;
+}
