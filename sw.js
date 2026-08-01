@@ -1,4 +1,4 @@
-const CACHE_NAME = "homeslop-shell-v9-mobile-stack";
+const CACHE_NAME = "homeslop-shell-v10-gap-normalize";
 const APP_SHELL = [
   "./",
   "./index.html",
