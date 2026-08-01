@@ -1,4 +1,4 @@
-const CACHE_NAME = "homeslop-shell-v10-gap-normalize";
+const CACHE_NAME = "homeslop-shell-v11-prose-spacing";
 const APP_SHELL = [
   "./",
   "./index.html",
@@ -7,6 +7,7 @@ const APP_SHELL = [
   "./app.js",
   "./reader-shadow.js",
   "./reader-mobile-layout.js",
+  "./reader-prose-spacing.js",
   "./manifest.webmanifest",
   "./icon.svg"
 ];
