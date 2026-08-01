@@ -10,6 +10,7 @@ const files = [
   "visibility-fix.css",
   "app.js",
   "reader-shadow.js",
+  "reader-mobile-layout.js",
   "manifest.webmanifest",
   "sw.js",
   "icon.svg",
