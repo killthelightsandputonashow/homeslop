@@ -1,11 +1,11 @@
-const CACHE_NAME = "homeslop-shell-v6-workskin-guard";
+const CACHE_NAME = "homeslop-shell-v7-shadow-dark";
 const APP_SHELL = [
   "./",
   "./index.html",
   "./styles.css",
   "./visibility-fix.css",
   "./app.js",
-  "./reader-enhancements.js",
+  "./reader-shadow.js",
   "./manifest.webmanifest",
   "./icon.svg"
 ];
