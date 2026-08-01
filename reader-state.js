@@ -44,6 +44,13 @@ function persistStore(key, value) {
 function openStateDatabase() {
   return new Promise((resolve, reject) => {
     const request = indexedDB.open(STATE_DB_NAME, STATE_DB_VERSION);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(STATE_STORE_NAME)) {
+        const store = db.createObjectStore(STATE_STORE_NAME, { keyPath: "id" });
+        store.createIndex("importedAt", "importedAt");
+      }
+    };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error);
   });
@@ -415,7 +422,6 @@ async function resolveActiveReader() {
   resolveTimer = 0;
 
   if (!visibleReader()) {
-    if (activeStory) currentProgressFromScroll();
     activeStory = null;
     activeStoryId = null;
     activeRenderKey = "";
@@ -484,13 +490,13 @@ document.addEventListener("visibilitychange", () => {
 if (bookList) {
   new MutationObserver(scheduleLibraryDecoration).observe(bookList, {
     childList: true,
-    subtree: true,
   });
 }
 
 if (readerView) {
   new MutationObserver(scheduleResolveReader).observe(readerView, {
     attributes: true,
+    attributeFilter: ["class"],
     childList: true,
     subtree: true,
     characterData: true,
