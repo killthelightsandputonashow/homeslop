@@ -36,15 +36,35 @@ function visibleBorderWidth(style) {
     .reduce((total, value) => total + value, 0);
 }
 
-function hasAuthoredPanel(candidate, userstuff) {
+function parseRgb(color) {
+  const match = String(color || "").match(/rgba?\((\d+(?:\.\d+)?)[,\s]+(\d+(?:\.\d+)?)[,\s]+(\d+(?:\.\d+)?)/i);
+  if (!match) return null;
+  return [Number(match[1]), Number(match[2]), Number(match[3])];
+}
+
+function colorsAreVisuallySame(first, second) {
+  const a = parseRgb(first);
+  const b = parseRgb(second);
+  if (!a || !b) return first === second;
+
+  const distance = Math.sqrt(
+    (a[0] - b[0]) ** 2 +
+    (a[1] - b[1]) ** 2 +
+    (a[2] - b[2]) ** 2,
+  );
+  return distance < 28;
+}
+
+function hasAuthoredPanel(candidate, userstuff, readerBackground) {
+  const readerRect = userstuff.getBoundingClientRect();
   let current = candidate;
 
   while (current && current !== userstuff.parentElement) {
     if (looksLikeAuthoredChatShell(current)) return true;
 
     const style = getComputedStyle(current);
+    const rect = current.getBoundingClientRect();
     const backgroundImage = style.backgroundImage && style.backgroundImage !== "none";
-    const backgroundColor = !isTransparent(style.backgroundColor);
     const border = visibleBorderWidth(style) > 1;
     const shadow = style.boxShadow && style.boxShadow !== "none";
     const padding =
@@ -53,7 +73,14 @@ function hasAuthoredPanel(candidate, userstuff) {
       (Number.parseFloat(style.paddingBottom) || 0) +
       (Number.parseFloat(style.paddingLeft) || 0);
 
-    if (backgroundImage || border || shadow || (backgroundColor && padding > 10)) return true;
+    const hasBackground = !isTransparent(style.backgroundColor);
+    const backgroundIsDistinct =
+      hasBackground && !colorsAreVisuallySame(style.backgroundColor, readerBackground);
+    const nearlyFullReaderWidth = rect.width >= readerRect.width * 0.92;
+
+    if (backgroundImage || border || shadow) return true;
+    if (backgroundIsDistinct && padding > 10 && !nearlyFullReaderWidth) return true;
+
     if (current === userstuff) break;
     current = current.parentElement;
   }
@@ -76,7 +103,7 @@ function candidateChatScore(candidate) {
   );
   const ratio = chatCount / nodes.length;
 
-  if (chatCount < 4 || ratio < 0.55) return null;
+  if (chatCount < 4 || ratio < 0.42) return null;
   return { chatCount, ratio, nodes };
 }
 
@@ -129,12 +156,6 @@ function ensureFallbackStyle(shadow) {
     }
   `;
   shadow.append(style);
-}
-
-function parseRgb(color) {
-  const match = String(color || "").match(/rgba?\((\d+(?:\.\d+)?)[,\s]+(\d+(?:\.\d+)?)[,\s]+(\d+(?:\.\d+)?)/i);
-  if (!match) return null;
-  return [Number(match[1]), Number(match[2]), Number(match[3])];
 }
 
 function linearChannel(value) {
@@ -199,13 +220,16 @@ function applyFallbackFormatting() {
     element.removeAttribute(FALLBACK_ATTR);
   });
 
+  const readerBackground = getComputedStyle(
+    shadow.querySelector(".reader-document") || workskin,
+  ).backgroundColor;
   const candidates = [];
 
   shadow.querySelectorAll("#workskin .userstuff").forEach((userstuff) => {
     [userstuff, ...userstuff.querySelectorAll("div, section, article")].forEach((candidate) => {
       if (candidate.closest(`[${FALLBACK_ATTR}]`)) return;
       const score = candidateChatScore(candidate);
-      if (!score || hasAuthoredPanel(candidate, userstuff)) return;
+      if (!score || hasAuthoredPanel(candidate, userstuff, readerBackground)) return;
 
       candidates.push({
         candidate,
