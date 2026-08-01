@@ -1,4 +1,4 @@
-const CACHE_NAME = "homeslop-shell-v1";
+const CACHE_NAME = "homeslop-shell-v4-chapters";
 const APP_SHELL = [
   "./",
   "./index.html",
@@ -24,28 +24,22 @@ self.addEventListener("activate", (event) => {
 
 self.addEventListener("fetch", (event) => {
   const requestUrl = new URL(event.request.url);
-
-  if (requestUrl.pathname.startsWith("/api/")) {
-    return;
-  }
-
-  if (event.request.method !== "GET") {
-    return;
-  }
+  if (requestUrl.pathname.startsWith("/api/") || event.request.method !== "GET") return;
 
   event.respondWith(
-    caches.match(event.request).then((cached) => {
-      if (cached) return cached;
-
-      return fetch(event.request).then((response) => {
-        if (!response || response.status !== 200 || response.type === "opaque") {
-          return response;
+    fetch(event.request)
+      .then((response) => {
+        if (response && response.status === 200 && response.type !== "opaque") {
+          const copy = response.clone();
+          caches.open(CACHE_NAME).then((cache) => cache.put(event.request, copy));
         }
-
-        const copy = response.clone();
-        caches.open(CACHE_NAME).then((cache) => cache.put(event.request, copy));
         return response;
-      });
-    })
+      })
+      .catch(async () => {
+        const cached = await caches.match(event.request);
+        if (cached) return cached;
+        if (event.request.mode === "navigate") return caches.match("./index.html");
+        throw new Error("Homeslop is offline and this file is not cached.");
+      })
   );
 });
