@@ -15,6 +15,23 @@ function jsonError(error, status = 502, diagnostics = null) {
   );
 }
 
+function readableError(value) {
+  if (typeof value === "string" && value.trim()) return value.trim();
+  if (value && typeof value === "object") {
+    if (typeof value.message === "string" && value.message.trim()) {
+      const code = typeof value.code === "string" ? ` (${value.code})` : "";
+      return `${value.message.trim()}${code}`;
+    }
+    if (typeof value.code === "string" && value.code.trim()) return value.code.trim();
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return String(value);
+    }
+  }
+  return String(value || "Unknown upstream error.");
+}
+
 export async function onRequestGet(context) {
   const requestUrl = new URL(context.request.url);
   const source = requestUrl.searchParams.get("url");
@@ -52,6 +69,7 @@ export async function onRequestGet(context) {
       502,
       {
         route: "cloudflare-to-vercel",
+        upstreamHost: upstreamUrl.hostname,
         durationMs: Date.now() - started,
         errorName: error instanceof Error ? error.name : "UnknownError",
         errorMessage: error instanceof Error ? error.message : String(error),
@@ -77,6 +95,36 @@ export async function onRequestGet(context) {
   responseHeaders.set("Referrer-Policy", "no-referrer");
   responseHeaders.set("X-Homeslop-Route", "cloudflare-to-vercel");
   responseHeaders.set("X-Homeslop-Relay-Duration", String(Date.now() - started));
+
+  if (!upstreamResponse.ok) {
+    const contentType = upstreamResponse.headers.get("content-type") || "";
+    let upstreamPayload = null;
+    let upstreamMessage = `Vercel returned HTTP ${upstreamResponse.status}.`;
+
+    if (contentType.includes("application/json")) {
+      upstreamPayload = await upstreamResponse.json().catch(() => null);
+      if (upstreamPayload?.error) {
+        upstreamMessage = readableError(upstreamPayload.error);
+      } else if (upstreamPayload) {
+        upstreamMessage = readableError(upstreamPayload);
+      }
+    } else {
+      const text = await upstreamResponse.text().catch(() => "");
+      if (text.trim()) upstreamMessage = text.trim().slice(0, 500);
+    }
+
+    return jsonError(
+      `Vercel importer error: ${upstreamMessage}`,
+      upstreamResponse.status,
+      {
+        route: "cloudflare-to-vercel",
+        upstreamHost: upstreamUrl.hostname,
+        upstreamStatus: upstreamResponse.status,
+        durationMs: Date.now() - started,
+        upstreamDiagnostics: upstreamPayload?.diagnostics || null,
+      },
+    );
+  }
 
   return new Response(upstreamResponse.body, {
     status: upstreamResponse.status,
