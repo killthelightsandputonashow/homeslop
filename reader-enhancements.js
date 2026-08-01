@@ -1,224 +1,150 @@
 const readerView = document.querySelector("#reader-view");
 const readerFrame = document.querySelector("#reader-frame");
 
-let frameResizeObserver = null;
-let pendingResize = 0;
+let pendingRepair = 0;
 
-const AO3ISH_READER_CSS = `
-  :where(*, *::before, *::after) { box-sizing: border-box; }
-
-  :where(html) {
+const SAFE_READER_CSS = `
+  html {
     width: 100%;
     min-height: 0;
     margin: 0;
     overflow-x: hidden;
-    overflow-y: hidden;
     background: #fff;
     color-scheme: light;
-  }
-
-  :where(body) {
-    width: 100%;
-    max-width: 46rem;
-    min-height: 0;
-    margin: 0 auto;
-    padding: 1rem 1rem 5rem;
-    overflow-x: hidden;
-    overflow-y: hidden;
-    color: #2a2a2a;
-    background: #fff;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
-    font-size: 16px;
-    line-height: 1.45;
-    text-rendering: optimizeLegibility;
     -webkit-text-size-adjust: 100%;
   }
 
-  :where(#workskin) {
+  body {
+    width: min(100%, 54rem);
+    min-height: 0;
+    margin: 0 auto;
+    padding: 1.05rem 1rem 4rem;
+    overflow-x: hidden;
+    color: #222;
+    background: #fff;
+    font-family: "Lucida Grande", "Lucida Sans Unicode", Verdana, Helvetica, Arial, sans-serif;
+    font-size: 16px;
+    line-height: 1.55;
+    text-rendering: optimizeLegibility;
+  }
+
+  #workskin {
     width: 100%;
     max-width: 100%;
     min-width: 0;
     margin: 0 auto;
   }
 
-  :where(#workskin .preface) {
-    margin: 0 0 1.6rem;
-    padding: 0.35rem 0 1.1rem;
-    border-bottom: 1px solid #d7d7d7;
-  }
-
-  :where(#workskin .preface .title) {
-    margin: 0.4rem 0 0.6rem;
-    color: #222;
-    font-family: Georgia, "Times New Roman", serif;
-    font-size: clamp(1.55rem, 7vw, 2.15rem);
-    line-height: 1.15;
-    text-align: center;
-  }
-
-  :where(#workskin .preface .byline) {
-    margin: 0.35rem 0 1.25rem;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
-    font-size: 1rem;
-    font-weight: 600;
-    line-height: 1.35;
-    text-align: center;
-  }
-
-  :where(#workskin .preface .summary, #workskin .preface .notes) {
-    width: min(100%, 40rem);
-    margin: 1.25rem auto 0;
-    padding: 0;
-  }
-
-  :where(#workskin .preface .summary h3, #workskin .preface .notes h3) {
-    margin: 0 0 0.45rem;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
-    font-size: 1rem;
-    line-height: 1.3;
-  }
-
-  :where(#workskin .userstuff) {
+  #workskin .userstuff {
     max-width: 100%;
-    color: #222;
-    font-family: Georgia, "Times New Roman", serif;
-    font-size: 1.02rem;
-    line-height: 1.58;
+  }
+
+  /* Only touch ordinary, top-level prose. Nested styled blocks are author territory. */
+  #workskin .userstuff > p,
+  #workskin .userstuff > ul,
+  #workskin .userstuff > ol,
+  #workskin .userstuff > blockquote {
     overflow-wrap: break-word;
   }
 
-  :where(#workskin .userstuff p) {
+  #workskin .userstuff > p {
     margin: 0 0 1.15em;
   }
 
-  :where(#workskin .userstuff h1, #workskin .userstuff h2, #workskin .userstuff h3,
-         #workskin .userstuff h4, #workskin .userstuff h5, #workskin .userstuff h6) {
-    margin: 1.5em 0 0.65em;
-    line-height: 1.22;
+  #workskin .userstuff > blockquote {
+    margin: 1.2em 1.25rem;
   }
 
-  :where(#workskin .userstuff blockquote) {
-    margin: 1.25em 1.5em;
-  }
-
-  :where(#workskin img, #workskin video, #workskin svg, #workskin canvas) {
+  #workskin .userstuff > img,
+  #workskin .userstuff > video,
+  #workskin .userstuff > svg,
+  #workskin .userstuff > canvas,
+  #workskin .userstuff > p > img,
+  #workskin .userstuff > p > video {
     max-width: 100%;
     height: auto;
   }
 
-  :where(#workskin pre, #workskin table) {
+  #workskin .userstuff > pre,
+  #workskin .userstuff > table {
     max-width: 100%;
     overflow-x: auto;
   }
 
-  :where(#workskin hr) {
-    margin: 2rem 0;
-    border: 0;
-    border-top: 1px solid #999;
+  #workskin .preface {
+    margin: 0 0 1.6rem;
   }
 
-  :where(#workskin a) {
-    color: #5e147d;
-    text-decoration-thickness: 1px;
-    text-underline-offset: 0.12em;
+  #workskin .preface .title {
+    margin: 0.2rem 0 0.7rem;
+    font-size: clamp(1.35rem, 6vw, 1.9rem);
+    line-height: 1.2;
+    text-align: center;
+  }
+
+  #workskin .preface .byline {
+    margin: 0.35rem 0 1rem;
+    font-size: 0.95rem;
+    text-align: center;
   }
 
   @media (max-width: 520px) {
-    :where(body) {
-      padding: 0.9rem 1rem 4rem;
+    body {
+      padding: 0.9rem 0.95rem 3.5rem;
     }
 
-    :where(#workskin .userstuff) {
-      font-size: 1rem;
-      line-height: 1.56;
-    }
-
-    :where(#workskin .userstuff blockquote) {
-      margin-inline: 0.85rem;
+    #workskin .userstuff > blockquote {
+      margin-inline: 0.75rem;
     }
   }
 `;
 
-function updateReaderMode() {
-  const isOpen = readerView?.classList.contains("is-visible") ?? false;
-  document.body.classList.toggle("reader-mode", isOpen);
-
-  if (isOpen) {
-    window.setTimeout(resizeReaderFrame, 0);
-    window.setTimeout(resizeReaderFrame, 120);
-  }
-}
-
-function disconnectFrameObservers() {
-  if (frameResizeObserver) {
-    frameResizeObserver.disconnect();
-    frameResizeObserver = null;
-  }
-
-  if (pendingResize) {
-    cancelAnimationFrame(pendingResize);
-    pendingResize = 0;
-  }
-}
-
-function resizeReaderFrame() {
-  if (!readerFrame || !readerView?.classList.contains("is-visible")) return;
-
-  const frameDocument = readerFrame.contentDocument;
-  if (!frameDocument?.documentElement || !frameDocument.body) return;
-
-  if (pendingResize) cancelAnimationFrame(pendingResize);
-
-  pendingResize = requestAnimationFrame(() => {
-    pendingResize = 0;
-    const html = frameDocument.documentElement;
-    const body = frameDocument.body;
-    const height = Math.max(
-      body.scrollHeight,
-      body.offsetHeight,
-      html.scrollHeight,
-      html.offsetHeight,
-      1,
-    );
-
-    readerFrame.style.height = `${Math.ceil(height)}px`;
-  });
-}
-
-function prepareReaderDocument() {
-  disconnectFrameObservers();
-
+function repairReaderDocument() {
   const frameDocument = readerFrame?.contentDocument;
   if (!frameDocument?.head || !frameDocument.body) return;
 
-  const previousStyle = frameDocument.querySelector("#homeslop-reader-defaults");
-  previousStyle?.remove();
+  if (pendingRepair) cancelAnimationFrame(pendingRepair);
+  pendingRepair = requestAnimationFrame(() => {
+    pendingRepair = 0;
 
-  const style = frameDocument.createElement("style");
-  style.id = "homeslop-reader-defaults";
-  style.textContent = AO3ISH_READER_CSS;
-  frameDocument.head.append(style);
+    /* Remove Homeslop's earlier blanket stylesheet, not the author's workskin. */
+    [...frameDocument.head.querySelectorAll("style")].forEach((style) => {
+      const css = style.textContent || "";
+      const isOldHomeslopDefaults =
+        css.includes(":where(*, *::before, *::after)") &&
+        css.includes("#workskin .userstuff p") &&
+        css.includes("text-rendering: optimizeLegibility");
 
-  readerFrame.setAttribute("scrolling", "no");
-  readerFrame.style.height = "1px";
+      if (isOldHomeslopDefaults) style.remove();
+    });
 
-  if ("ResizeObserver" in window) {
-    frameResizeObserver = new ResizeObserver(resizeReaderFrame);
-    frameResizeObserver.observe(frameDocument.documentElement);
-    frameResizeObserver.observe(frameDocument.body);
-  }
+    frameDocument.querySelector("#homeslop-safe-reader-defaults")?.remove();
+    const safeStyle = frameDocument.createElement("style");
+    safeStyle.id = "homeslop-safe-reader-defaults";
+    safeStyle.textContent = SAFE_READER_CSS;
 
-  frameDocument.fonts?.ready.then(resizeReaderFrame).catch(() => {});
+    /* Put our gentle defaults before author CSS so the workskin always wins. */
+    const firstStyle = frameDocument.head.querySelector("style");
+    if (firstStyle) {
+      frameDocument.head.insertBefore(safeStyle, firstStyle);
+    } else {
+      frameDocument.head.append(safeStyle);
+    }
 
-  frameDocument.querySelectorAll("img, video, audio").forEach((asset) => {
-    asset.addEventListener("load", resizeReaderFrame, { once: true });
-    asset.addEventListener("error", resizeReaderFrame, { once: true });
+    readerFrame.dispatchEvent(new Event("homeslop-reader-repaired"));
   });
-
-  resizeReaderFrame();
-  window.setTimeout(resizeReaderFrame, 80);
-  window.setTimeout(resizeReaderFrame, 350);
 }
+
+function updateReaderMode() {
+  const isOpen = readerView?.classList.contains("is-visible") ?? false;
+  document.body.classList.toggle("reader-mode", isOpen);
+  if (isOpen) window.setTimeout(repairReaderDocument, 0);
+}
+
+readerFrame?.addEventListener("load", () => {
+  repairReaderDocument();
+  window.setTimeout(repairReaderDocument, 80);
+});
 
 if (readerView) {
   new MutationObserver(updateReaderMode).observe(readerView, {
@@ -226,9 +152,5 @@ if (readerView) {
     attributeFilter: ["class"],
   });
 }
-
-readerFrame?.addEventListener("load", prepareReaderDocument);
-window.addEventListener("resize", resizeReaderFrame);
-window.addEventListener("orientationchange", () => window.setTimeout(resizeReaderFrame, 150));
 
 updateReaderMode();
