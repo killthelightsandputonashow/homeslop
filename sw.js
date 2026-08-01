@@ -1,4 +1,4 @@
-const CACHE_NAME = "homeslop-shell-v8-reader-width";
+const CACHE_NAME = "homeslop-shell-v9-mobile-stack";
 const APP_SHELL = [
   "./",
   "./index.html",
@@ -6,6 +6,7 @@ const APP_SHELL = [
   "./visibility-fix.css",
   "./app.js",
   "./reader-shadow.js",
+  "./reader-mobile-layout.js",
   "./manifest.webmanifest",
   "./icon.svg"
 ];
