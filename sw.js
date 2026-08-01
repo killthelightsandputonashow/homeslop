@@ -1,4 +1,4 @@
-const CACHE_NAME = "homeslop-shell-v15-fallback-dark-fix";
+const CACHE_NAME = "homeslop-shell-v16-chat-run-detector";
 const APP_SHELL = [
   "./",
   "./index.html",
