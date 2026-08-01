@@ -1,11 +1,11 @@
 {
   "name": "homeslop",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "scripts": {
     "build": "node scripts/build.mjs",
-    "check": "node --check app.js && node --check worker.js && node --check functions/api/import.js",
+    "check": "node --check app.js && node --check worker.js && node --check functions/api/import.js && node --check api/import.js",
     "deploy": "wrangler deploy"
   },
   "devDependencies": {
