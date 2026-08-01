@@ -2,24 +2,45 @@
 
 A phone-first reader for unusually formatted AO3 works.
 
-Homeslop preserves the author’s work HTML and CSS instead of flattening everything into generic ebook text. The first build includes:
+Homeslop preserves the author’s work HTML and CSS instead of flattening everything into generic ebook text. The current build includes:
 
 - a retro Homestuck-adjacent mobile UI
-- AO3 URL import through a same-site serverless endpoint
+- AO3 URL import through a separate Vercel bridge
 - local IndexedDB storage
 - an offline-capable library shell
 - isolated `iframe` rendering for imported work HTML
 
-## Local preview
+## Hosting layout
 
-Open `index.html` through a local static server. The interface itself works without a build step.
+Homeslop itself runs on Cloudflare Workers at:
 
-## AO3 import endpoint
+`https://homeslop.insane-but-smart.workers.dev`
 
-`functions/api/import.js` is written for Cloudflare Pages Functions. Deploy the repository as a Cloudflare Pages project to enable `/api/import`.
+AO3 imports are fetched by a separate Vercel function so the request does not use Cloudflare’s broken AO3 route:
 
-The importer currently saves the full-work HTML and inline workskin CSS. Downloading and rewriting every external image/font asset for complete offline fidelity is a later milestone.
+`https://homeslop-importer-killthelightsandputonashow.vercel.app/api/import`
+
+The Cloudflare endpoint at `/api/import` relays requests to that Vercel function. Imported works remain stored only in the browser on the reader’s device.
+
+## Deploy the Vercel importer
+
+1. Create a new Vercel project from `killthelightsandputonashow/homeslop`.
+2. Name the project exactly `homeslop-importer-killthelightsandputonashow`.
+3. Keep the root directory as the repository root.
+4. Leave the framework preset as `Other` or `None`.
+5. Leave build and output settings at their defaults.
+6. Deploy.
+
+Vercel automatically exposes `api/import.js` as `/api/import`.
+
+## Cloudflare deployment
+
+Cloudflare uses `wrangler.jsonc`, `worker.js`, and `functions/api/import.js`. Its relay defaults to the Vercel URL above. The upstream can also be overridden with a Cloudflare environment variable named `UPSTREAM_IMPORTER_URL`.
+
+## Offline status
+
+The application shell and imported work HTML are local. External images and fonts may still require internet until the asset-downloader milestone is finished.
 
 ## Privacy
 
-Imported works are stored in the browser on your device. The serverless function only proxies the AO3 page requested by the user and does not keep a library or account database.
+Imported works are stored in the browser on your device. Neither the Cloudflare relay nor the Vercel importer keeps a library or account database.
