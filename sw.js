@@ -1,4 +1,4 @@
-const CACHE_NAME = "homeslop-shell-v13-progress-fallback";
+const CACHE_NAME = "homeslop-shell-v14-progress-stable";
 const APP_SHELL = [
   "./",
   "./index.html",
