@@ -1,8 +1,9 @@
-const CACHE_NAME = "homeslop-shell-v4-chapters";
+const CACHE_NAME = "homeslop-shell-v5-hidden-fix";
 const APP_SHELL = [
   "./",
   "./index.html",
   "./styles.css",
+  "./visibility-fix.css",
   "./app.js",
   "./manifest.webmanifest",
   "./icon.svg"
