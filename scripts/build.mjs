@@ -9,6 +9,7 @@ const files = [
   "styles.css",
   "visibility-fix.css",
   "app.js",
+  "reader-enhancements.js",
   "manifest.webmanifest",
   "sw.js",
   "icon.svg",
