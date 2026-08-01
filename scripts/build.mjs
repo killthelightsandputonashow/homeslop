@@ -7,6 +7,7 @@ const dist = join(root, "dist");
 const files = [
   "index.html",
   "styles.css",
+  "visibility-fix.css",
   "app.js",
   "manifest.webmanifest",
   "sw.js",
