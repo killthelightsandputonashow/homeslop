@@ -31,6 +31,7 @@ if (!frame || !frameWrap || !readerView) {
       display: block;
       width: 100%;
       min-width: 0;
+      box-sizing: border-box;
       background: #fff;
     }
 
@@ -110,7 +111,8 @@ if (!frame || !frameWrap || !readerView) {
         display: block;
         width: 100%;
         min-width: 0;
-        overflow: hidden;
+        box-sizing: border-box;
+        overflow-x: hidden;
         color: var(--reader-text);
         background: var(--reader-bg);
         color-scheme: light;
@@ -130,6 +132,7 @@ if (!frame || !frameWrap || !readerView) {
         min-width: 0;
         margin: 0 auto;
         padding: 1rem clamp(.9rem, 4vw, 2rem) 4.5rem;
+        box-sizing: border-box;
         overflow-x: hidden;
         color: var(--reader-text);
         background: var(--reader-bg);
