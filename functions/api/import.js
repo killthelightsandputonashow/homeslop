@@ -1,5 +1,5 @@
 const DEFAULT_UPSTREAM_IMPORTER =
-  "https://homeslop-importer-killthelightsandputonashow.vercel.app/api/import";
+  "https://homeslop-importer-killthelightsandp.vercel.app/api/import";
 
 function jsonError(error, status = 502, diagnostics = null) {
   return Response.json(
