@@ -1,5 +1,6 @@
 const AO3_HOST = "archiveofourown.org";
 const USER_AGENT = "Homeslop/0.1 personal AO3 reader (single user, on-demand imports)";
+const AO3_TIMEOUT_MS = 20000;
 
 function jsonError(error, status = 400, extraHeaders = {}) {
   return Response.json(
@@ -40,15 +41,23 @@ function validateSource(value) {
 }
 
 async function requestAO3(url) {
-  return fetch(url, {
-    method: "GET",
-    redirect: "follow",
-    headers: {
-      Accept: "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
-      "Accept-Language": "en-US,en;q=0.8",
-      "User-Agent": USER_AGENT,
-    },
-  });
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), AO3_TIMEOUT_MS);
+
+  try {
+    return await fetch(url, {
+      method: "GET",
+      redirect: "follow",
+      signal: controller.signal,
+      headers: {
+        Accept: "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.8",
+        "User-Agent": USER_AGENT,
+      },
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 export async function onRequestGet(context) {
@@ -69,7 +78,10 @@ export async function onRequestGet(context) {
   let response;
   try {
     response = await requestAO3(ao3Url);
-  } catch {
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") {
+      return jsonError("AO3 did not answer within 20 seconds. It may be slow or refusing Cloudflare traffic right now. Try again in a little while.", 504);
+    }
     return jsonError("Homeslop could not establish a connection to AO3. Try again when AO3 is reachable.", 502);
   }
 
