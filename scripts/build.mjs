@@ -12,6 +12,8 @@ const files = [
   "reader-shadow.js",
   "reader-mobile-layout.js",
   "reader-prose-spacing.js",
+  "reader-fallback-format.js",
+  "reader-state.js",
   "manifest.webmanifest",
   "sw.js",
   "icon.svg",
