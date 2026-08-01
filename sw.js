@@ -1,4 +1,4 @@
-const CACHE_NAME = "homeslop-shell-v17-progress-and-logs";
+const CACHE_NAME = "homeslop-shell-v18-single-chat-layer";
 const APP_SHELL = [
   "./",
   "./index.html",
