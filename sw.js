@@ -1,4 +1,4 @@
-const CACHE_NAME = "homeslop-shell-v18-single-chat-layer";
+const CACHE_NAME = "homeslop-shell-v19-music-player";
 const APP_SHELL = [
   "./",
   "./index.html",
@@ -10,6 +10,7 @@ const APP_SHELL = [
   "./reader-prose-spacing.js",
   "./reader-fallback-format.js",
   "./reader-state.js",
+  "./reader-music.js",
   "./manifest.webmanifest",
   "./icon.svg"
 ];
