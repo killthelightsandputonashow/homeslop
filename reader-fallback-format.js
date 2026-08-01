@@ -149,6 +149,29 @@ function repairContrast(container) {
   });
 }
 
+function unwrapGenerated(element) {
+  const parent = element.parentNode;
+  if (!parent) return;
+  while (element.firstChild) parent.insertBefore(element.firstChild, element);
+  element.remove();
+}
+
+function enforceSingleFallbackLayer(root) {
+  const fallbacks = [...root.querySelectorAll(`[${FALLBACK_ATTR}]`)];
+
+  fallbacks.forEach((outer) => {
+    if (!outer.querySelector(`[${FALLBACK_ATTR}]`)) return;
+
+    outer.removeAttribute(FALLBACK_ATTR);
+    outer.removeAttribute(CONTRAST_ATTR);
+    outer.style.removeProperty("--homeslop-safe-color");
+
+    if (outer.hasAttribute(GENERATED_ATTR)) {
+      unwrapGenerated(outer);
+    }
+  });
+}
+
 function deepestDenseCandidates(userstuff) {
   const all = [userstuff, ...userstuff.querySelectorAll("p, div, section, article, blockquote, li")];
   const dense = all.filter((element) => {
@@ -198,11 +221,20 @@ function siblingRuns(parent) {
   return runs;
 }
 
+function elementsInRun(run) {
+  return run.children.slice(run.start, run.end + 1);
+}
+
 function wrapRun(parent, run, userstuff, readerBackground) {
   const first = run.children[run.start];
   const last = run.children[run.end];
   if (!first || !last || first.parentElement !== parent || last.parentElement !== parent) return null;
-  if (first.closest(`[${FALLBACK_ATTR}]`)) return null;
+
+  const range = elementsInRun(run);
+  const overlapsFallback = range.some(
+    (element) => element.matches(`[${FALLBACK_ATTR}]`) || element.querySelector(`[${FALLBACK_ATTR}]`),
+  );
+  if (overlapsFallback || first.closest(`[${FALLBACK_ATTR}]`)) return null;
   if (alreadyReadablePanel(parent, userstuff, readerBackground)) return null;
 
   const wrapper = document.createElement("div");
@@ -233,24 +265,27 @@ function applyFormatting() {
   const readerBackground = getComputedStyle(shadow.querySelector(".reader-document") || workskin).backgroundColor;
 
   try {
-    shadow.querySelectorAll(`[${FALLBACK_ATTR}]`).forEach(repairContrast);
+    enforceSingleFallbackLayer(workskin);
+
     shadow.querySelectorAll("#workskin .userstuff").forEach((userstuff) => {
       deepestDenseCandidates(userstuff).forEach((candidate) => {
         if (candidate.closest(`[${FALLBACK_ATTR}]`)) return;
+        if (candidate.querySelector(`[${FALLBACK_ATTR}]`)) return;
         if (alreadyReadablePanel(candidate, userstuff, readerBackground)) return;
         candidate.setAttribute(FALLBACK_ATTR, "");
-        requestAnimationFrame(() => repairContrast(candidate));
       });
 
       const parents = [userstuff, ...userstuff.querySelectorAll("div, section, article")]
         .filter((parent) => !parent.closest(`[${GENERATED_ATTR}]`));
       parents.forEach((parent) => {
         [...siblingRuns(parent)].reverse().forEach((run) => {
-          const wrapper = wrapRun(parent, run, userstuff, readerBackground);
-          if (wrapper) requestAnimationFrame(() => repairContrast(wrapper));
+          wrapRun(parent, run, userstuff, readerBackground);
         });
       });
     });
+
+    enforceSingleFallbackLayer(workskin);
+    workskin.querySelectorAll(`[${FALLBACK_ATTR}]`).forEach(repairContrast);
   } finally {
     applying = false;
   }
