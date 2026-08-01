@@ -1,4 +1,4 @@
-const CACHE_NAME = "homeslop-shell-v12-nested-prose";
+const CACHE_NAME = "homeslop-shell-v13-progress-fallback";
 const APP_SHELL = [
   "./",
   "./index.html",
@@ -8,6 +8,8 @@ const APP_SHELL = [
   "./reader-shadow.js",
   "./reader-mobile-layout.js",
   "./reader-prose-spacing.js",
+  "./reader-fallback-format.js",
+  "./reader-state.js",
   "./manifest.webmanifest",
   "./icon.svg"
 ];
