@@ -1,0 +1,19 @@
+name: Check Homeslop
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Check browser JavaScript
+        run: node --check app.js
+      - name: Check import function
+        run: node --check functions/api/import.js
