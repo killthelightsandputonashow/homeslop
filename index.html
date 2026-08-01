@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#f7b500" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Homeslop" />
+    <link rel="manifest" href="./manifest.webmanifest" />
+    <link rel="stylesheet" href="./styles.css" />
+    <title>Homeslop</title>
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="window-titlebar">
+        <div class="app-mark" aria-hidden="true">HS</div>
+        <div class="title-copy">
+          <strong>HOMESLOP</strong>
+          <span>weird fic reader v0.1</span>
+        </div>
+        <div class="window-controls" aria-hidden="true">
+          <span>_</span><span>□</span><span>×</span>
+        </div>
+      </header>
+
+      <nav class="tabs" aria-label="Main navigation">
+        <button class="tab is-active" data-view="library" type="button">LIBRARY</button>
+        <button class="tab" data-view="import" type="button">+ ADD STORY</button>
+      </nav>
+
+      <main>
+        <section id="library-view" class="view is-visible" aria-labelledby="library-heading">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">LOCAL ARCHIVE</p>
+              <h1 id="library-heading">Your stories</h1>
+            </div>
+            <span id="book-count" class="counter">0 FILES</span>
+          </div>
+
+          <div id="empty-library" class="empty-state">
+            <div class="empty-icon" aria-hidden="true">▤</div>
+            <p>No stories imported yet.</p>
+            <button class="bevel-button accent" data-go-import type="button">IMPORT FROM AO3</button>
+          </div>
+
+          <div id="book-list" class="book-list" hidden></div>
+        </section>
+
+        <section id="import-view" class="view" aria-labelledby="import-heading">
+          <div class="terminal-panel">
+            <div class="terminal-label">== STORY IMPORT TERMINAL ==</div>
+
+            <div class="import-copy">
+              <p class="eyebrow">SOURCE: ARCHIVE OF OUR OWN</p>
+              <h1 id="import-heading">Paste an AO3 work link</h1>
+              <p class="muted">Homeslop will request the full work page, preserve the work HTML and inline workskin CSS, then save it in this browser.</p>
+            </div>
+
+            <form id="import-form" novalidate>
+              <label for="ao3-url">AO3 URL</label>
+              <input
+                id="ao3-url"
+                name="url"
+                type="url"
+                inputmode="url"
+                autocomplete="off"
+                autocapitalize="none"
+                spellcheck="false"
+                placeholder="https://archiveofourown.org/works/123456"
+                required
+              />
+              <button id="import-button" class="bevel-button accent wide" type="submit">IMPORT STORY</button>
+            </form>
+
+            <div class="status-box" aria-live="polite">
+              <div class="status-line">
+                <span id="status-light" class="status-light idle"></span>
+                <strong id="status-title">WAITING FOR INPUT</strong>
+              </div>
+              <pre id="status-log">&gt; paste a work URL to begin.</pre>
+            </div>
+
+            <details class="compatibility-note">
+              <summary>WHAT THIS BUILD PRESERVES</summary>
+              <p>Work HTML, element classes, inline styles, and inline workskin CSS. External images and fonts may still require internet until the asset-downloader milestone is finished.</p>
+            </details>
+          </div>
+        </section>
+
+        <section id="reader-view" class="view reader-view" aria-labelledby="reader-title">
+          <div class="reader-toolbar">
+            <button id="reader-back" class="bevel-button small" type="button">← LIBRARY</button>
+            <div class="reader-heading">
+              <p id="reader-author" class="eyebrow"></p>
+              <h1 id="reader-title">Untitled work</h1>
+            </div>
+            <button id="reader-delete" class="bevel-button small danger" type="button">DELETE</button>
+          </div>
+          <div class="reader-frame-wrap">
+            <iframe id="reader-frame" title="Imported story" sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox"></iframe>
+          </div>
+        </section>
+      </main>
+
+      <footer class="statusbar">
+        <span>MODE: <strong>LOCAL</strong></span>
+        <span id="footer-status">READY</span>
+      </footer>
+    </div>
+
+    <template id="book-template">
+      <article class="book-row">
+        <button class="book-open" type="button">
+          <span class="book-source">AO3</span>
+          <span class="book-meta">
+            <strong class="book-title"></strong>
+            <span class="book-author"></span>
+          </span>
+          <span class="book-arrow" aria-hidden="true">▶</span>
+        </button>
+      </article>
+    </template>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
