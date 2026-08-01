@@ -1,4 +1,4 @@
-const CACHE_NAME = "homeslop-shell-v11-prose-spacing";
+const CACHE_NAME = "homeslop-shell-v12-nested-prose";
 const APP_SHELL = [
   "./",
   "./index.html",
