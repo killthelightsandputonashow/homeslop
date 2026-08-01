@@ -24,8 +24,16 @@ const readerFrame = document.querySelector("#reader-frame");
 const readerTitle = document.querySelector("#reader-title");
 const readerAuthor = document.querySelector("#reader-author");
 const readerDelete = document.querySelector("#reader-delete");
+const readerChapterSelect = document.querySelector("#reader-chapter-select");
+const readerChapterName = document.querySelector("#reader-chapter-name");
+const readerChapterProgress = document.querySelector("#reader-chapter-progress");
+const readerPrevButtons = [...document.querySelectorAll("[data-reader-prev]")];
+const readerNextButtons = [...document.querySelectorAll("[data-reader-next]")];
 
-let activeStoryId = null;
+let activeStory = null;
+let activeChapterIndex = 0;
+let frameResizeObserver = null;
+let pendingFrameResize = 0;
 let logLines = ["> paste a work URL to begin."];
 
 function openDatabase() {
@@ -88,6 +96,8 @@ function showView(name) {
     tab.classList.toggle("is-active", tab.dataset.view === name);
   });
 
+  document.body.classList.toggle("reader-mode", name === "reader");
+  if (name !== "reader") disconnectFrameResize();
   window.scrollTo({ top: 0, behavior: "instant" });
 }
 
@@ -113,6 +123,20 @@ function setStatus(kind, title, line, replace = false) {
 
   statusLog.textContent = logLines.join("\n");
   statusLog.scrollTop = statusLog.scrollHeight;
+}
+
+function readableError(value) {
+  if (typeof value === "string") return value;
+  if (value && typeof value === "object") {
+    if (typeof value.message === "string") return value.message;
+    if (typeof value.error === "string") return value.error;
+    try {
+      return JSON.stringify(value, null, 2);
+    } catch {
+      return String(value);
+    }
+  }
+  return String(value || "Unknown import error.");
 }
 
 function normalizeAO3Url(value) {
@@ -150,32 +174,40 @@ function absolutizeUrl(value, base) {
   }
 }
 
-function extractWork(responseHtml, sourceUrl, workId) {
-  const parser = new DOMParser();
-  const documentNode = parser.parseFromString(responseHtml, "text/html");
-  const workskin = documentNode.querySelector("#workskin");
+function sanitizeWorkskin(workskin, sourceUrl) {
+  const clone = workskin.cloneNode(true);
+  clone
+    .querySelectorAll("script, iframe, object, embed, base, meta[http-equiv='refresh']")
+    .forEach((element) => element.remove());
 
-  if (!workskin) {
-    const errorText = documentNode.querySelector(".error, .flash.error")?.textContent?.trim();
-    throw new Error(errorText || "AO3 returned a page, but Homeslop could not find the work body.");
-  }
+  clone.querySelectorAll("*").forEach((element) => {
+    [...element.attributes].forEach((attribute) => {
+      const name = attribute.name.toLowerCase();
+      const value = attribute.value.trim();
 
-  const title =
-    documentNode.querySelector("h2.title.heading")?.textContent?.trim() ||
-    documentNode.querySelector("meta[property='og:title']")?.getAttribute("content")?.trim() ||
-    `AO3 Work ${workId}`;
+      if (name.startsWith("on")) {
+        element.removeAttribute(attribute.name);
+        return;
+      }
 
-  const authorLinks = [...documentNode.querySelectorAll("h3.byline.heading a[rel='author'], h3.byline.heading a")];
-  const author = authorLinks.map((link) => link.textContent.trim()).filter(Boolean).join(", ") || "Anonymous";
+      if (["src", "href", "poster", "action", "xlink:href"].includes(name)) {
+        if (/^\s*javascript:/i.test(value) || /^\s*data:text\/html/i.test(value)) {
+          element.removeAttribute(attribute.name);
+          return;
+        }
 
-  const clonedWorkskin = workskin.cloneNode(true);
-  clonedWorkskin.querySelectorAll("script").forEach((script) => script.remove());
+        if (name === "action") {
+          element.removeAttribute(attribute.name);
+          return;
+        }
 
-  clonedWorkskin.querySelectorAll("img[src], source[src], video[src], audio[src]").forEach((element) => {
-    element.setAttribute("src", absolutizeUrl(element.getAttribute("src"), sourceUrl));
+        const resolved = absolutizeUrl(value, sourceUrl);
+        element.setAttribute(attribute.name, resolved);
+      }
+    });
   });
 
-  clonedWorkskin.querySelectorAll("[srcset]").forEach((element) => {
+  clone.querySelectorAll("[srcset]").forEach((element) => {
     const rewritten = element
       .getAttribute("srcset")
       .split(",")
@@ -187,27 +219,137 @@ function extractWork(responseHtml, sourceUrl, workId) {
     element.setAttribute("srcset", rewritten);
   });
 
-  clonedWorkskin.querySelectorAll("a[href]").forEach((anchor) => {
-    anchor.setAttribute("href", absolutizeUrl(anchor.getAttribute("href"), sourceUrl));
+  clone.querySelectorAll("a[href]").forEach((anchor) => {
     anchor.setAttribute("target", "_blank");
     anchor.setAttribute("rel", "noopener noreferrer");
   });
 
+  return clone;
+}
+
+function chapterTitleFromNode(node, index) {
+  const title = node.querySelector(
+    ".chapter.preface .title, .preface .title, h2.title, h3.title",
+  )?.textContent?.replace(/\s+/g, " ").trim();
+
+  return title || `Chapter ${index + 1}`;
+}
+
+function splitWorkskinIntoChapters(workskin) {
+  const chaptersContainer = workskin.querySelector("#chapters");
+  let chapterNodes = [];
+
+  if (chaptersContainer) {
+    chapterNodes = [...chaptersContainer.children].filter((child) =>
+      child.classList?.contains("chapter"),
+    );
+
+    if (chapterNodes.length === 0) {
+      chapterNodes = [...chaptersContainer.querySelectorAll(":scope > .chapter")];
+    }
+  }
+
+  if (chapterNodes.length > 0) {
+    return chapterNodes.map((chapterNode, index) => {
+      const shell = workskin.cloneNode(false);
+      const chapterShell = chaptersContainer.cloneNode(false);
+      chapterShell.append(chapterNode.cloneNode(true));
+      shell.append(chapterShell);
+
+      return {
+        id: chapterNode.id || `chapter-${index + 1}`,
+        title: chapterTitleFromNode(chapterNode, index),
+        html: shell.outerHTML,
+      };
+    });
+  }
+
+  if (chaptersContainer) {
+    const shell = workskin.cloneNode(false);
+    shell.append(chaptersContainer.cloneNode(true));
+    return [
+      {
+        id: "chapter-1",
+        title: chapterTitleFromNode(chaptersContainer, 0),
+        html: shell.outerHTML,
+      },
+    ];
+  }
+
+  return [
+    {
+      id: "chapter-1",
+      title: chapterTitleFromNode(workskin, 0),
+      html: workskin.outerHTML,
+    },
+  ];
+}
+
+function extractWork(responseHtml, sourceUrl, workId) {
+  const parser = new DOMParser();
+  const documentNode = parser.parseFromString(responseHtml, "text/html");
+  const workskin = documentNode.querySelector("#workskin");
+
+  if (!workskin) {
+    const errorText = documentNode.querySelector(".error, .flash.error")?.textContent?.trim();
+    throw new Error(errorText || "AO3 returned a page, but Homeslop could not find the work body.");
+  }
+
+  const title =
+    documentNode.querySelector("h2.title.heading")?.textContent?.replace(/\s+/g, " ").trim() ||
+    documentNode.querySelector("meta[property='og:title']")?.getAttribute("content")?.trim() ||
+    `AO3 Work ${workId}`;
+
+  const authorLinks = [
+    ...documentNode.querySelectorAll("h3.byline.heading a[rel='author'], h3.byline.heading a"),
+  ];
+  const author = authorLinks.map((link) => link.textContent.trim()).filter(Boolean).join(", ") || "Anonymous";
+
+  const cleanWorkskin = sanitizeWorkskin(workskin, sourceUrl);
   const inlineStyles = [...documentNode.querySelectorAll("style")]
     .map((style) => style.textContent || "")
     .filter((css) => css.trim().length > 0)
     .join("\n\n");
+  const chapters = splitWorkskinIntoChapters(cleanWorkskin);
 
   return {
     title,
     author,
-    workHtml: clonedWorkskin.outerHTML,
+    workHtml: cleanWorkskin.outerHTML,
     inlineStyles,
+    chapters,
   };
 }
 
-function buildReaderDocument(story) {
-  const escapedBase = story.sourceUrl.replaceAll('"', "&quot;");
+function ensureStoryChapters(story) {
+  if (Array.isArray(story.chapters) && story.chapters.length > 0) return story;
+
+  const parser = new DOMParser();
+  const documentNode = parser.parseFromString(story.workHtml || "", "text/html");
+  const workskin = documentNode.querySelector("#workskin") || documentNode.body.firstElementChild;
+
+  if (!workskin) {
+    story.chapters = [
+      {
+        id: "chapter-1",
+        title: "Chapter 1",
+        html: story.workHtml || "<div id=\"workskin\"><p>Story body unavailable.</p></div>",
+      },
+    ];
+  } else {
+    story.chapters = splitWorkskinIntoChapters(workskin);
+  }
+
+  story.lastChapterIndex = Math.min(story.lastChapterIndex || 0, story.chapters.length - 1);
+  return story;
+}
+
+function escapeAttribute(value) {
+  return String(value || "").replaceAll("&", "&amp;").replaceAll('"', "&quot;");
+}
+
+function buildReaderDocument(story, chapter) {
+  const escapedBase = escapeAttribute(story.sourceUrl);
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -215,17 +357,185 @@ function buildReaderDocument(story) {
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <base href="${escapedBase}">
   <style>
-    html { min-height: 100%; background: #fff; }
-    body { min-height: 100%; margin: 0; padding: 18px 14px 50px; color: #111; background: #fff; }
-    #workskin { max-width: 100%; margin: 0 auto; }
-    img, video, svg, canvas { max-width: 100%; }
-    pre { max-width: 100%; overflow-x: auto; }
-    @media (min-width: 720px) { body { padding-inline: 7vw; } }
+    :where(*, *::before, *::after) { box-sizing: border-box; }
+    :where(html) {
+      width: 100%;
+      min-height: 0;
+      margin: 0;
+      overflow-x: clip;
+      background: #fff;
+      color-scheme: light;
+      -webkit-text-size-adjust: 100%;
+    }
+    :where(body) {
+      width: min(100%, 54rem);
+      min-height: 0;
+      margin: 0 auto;
+      padding: 1.05rem 1rem 4rem;
+      overflow-x: clip;
+      color: #222;
+      background: #fff;
+      font-family: "Lucida Grande", "Lucida Sans Unicode", Verdana, Helvetica, Arial, sans-serif;
+      font-size: 16px;
+      line-height: 1.55;
+      text-rendering: optimizeLegibility;
+    }
+    :where(#workskin) {
+      width: 100%;
+      max-width: 100%;
+      min-width: 0;
+      margin: 0 auto;
+    }
+    :where(#workskin .userstuff) {
+      max-width: 100%;
+      color: inherit;
+      font-family: inherit;
+      font-size: 1rem;
+      line-height: 1.55;
+      overflow-wrap: anywhere;
+    }
+    :where(#workskin .userstuff p) { margin: 0 0 1.15em; }
+    :where(#workskin .preface) { margin: 0 0 1.6rem; }
+    :where(#workskin .preface .title) {
+      margin: 0.2rem 0 0.7rem;
+      font-family: inherit;
+      font-size: clamp(1.35rem, 6vw, 1.9rem);
+      line-height: 1.2;
+      text-align: center;
+    }
+    :where(#workskin .preface .byline) {
+      margin: 0.35rem 0 1rem;
+      font-size: 0.95rem;
+      text-align: center;
+    }
+    :where(#workskin img, #workskin video, #workskin svg, #workskin canvas) {
+      max-width: 100%;
+      height: auto;
+    }
+    :where(#workskin pre, #workskin table) {
+      max-width: 100%;
+      overflow-x: auto;
+    }
+    :where(#workskin blockquote) { margin-inline: 1.25rem; }
+    :where(#workskin a) { color: #5e147d; }
+    @media (max-width: 520px) {
+      :where(body) { padding: 0.9rem 0.95rem 3.5rem; }
+      :where(#workskin blockquote) { margin-inline: 0.75rem; }
+    }
   </style>
   <style>${story.inlineStyles || ""}</style>
 </head>
-<body>${story.workHtml}</body>
+<body>${chapter.html}</body>
 </html>`;
+}
+
+function disconnectFrameResize() {
+  if (frameResizeObserver) {
+    frameResizeObserver.disconnect();
+    frameResizeObserver = null;
+  }
+  if (pendingFrameResize) {
+    cancelAnimationFrame(pendingFrameResize);
+    pendingFrameResize = 0;
+  }
+}
+
+function resizeReaderFrame() {
+  if (!readerFrame || !views.reader.classList.contains("is-visible")) return;
+  const frameDocument = readerFrame.contentDocument;
+  if (!frameDocument?.documentElement || !frameDocument.body) return;
+
+  if (pendingFrameResize) cancelAnimationFrame(pendingFrameResize);
+  pendingFrameResize = requestAnimationFrame(() => {
+    pendingFrameResize = 0;
+    const html = frameDocument.documentElement;
+    const body = frameDocument.body;
+    const height = Math.max(
+      body.scrollHeight,
+      body.offsetHeight,
+      html.scrollHeight,
+      html.offsetHeight,
+      1,
+    );
+    readerFrame.style.height = `${Math.ceil(height)}px`;
+  });
+}
+
+function prepareReaderFrame() {
+  disconnectFrameResize();
+  const frameDocument = readerFrame.contentDocument;
+  if (!frameDocument?.documentElement || !frameDocument.body) return;
+
+  readerFrame.setAttribute("scrolling", "no");
+  readerFrame.style.height = "1px";
+  frameDocument.documentElement.style.overflowY = "hidden";
+  frameDocument.body.style.overflowY = "hidden";
+
+  if ("ResizeObserver" in window) {
+    frameResizeObserver = new ResizeObserver(resizeReaderFrame);
+    frameResizeObserver.observe(frameDocument.documentElement);
+    frameResizeObserver.observe(frameDocument.body);
+  }
+
+  frameDocument.fonts?.ready.then(resizeReaderFrame).catch(() => {});
+  frameDocument.querySelectorAll("img, video, audio").forEach((asset) => {
+    asset.addEventListener("load", resizeReaderFrame, { once: true });
+    asset.addEventListener("error", resizeReaderFrame, { once: true });
+  });
+
+  resizeReaderFrame();
+  setTimeout(resizeReaderFrame, 100);
+  setTimeout(resizeReaderFrame, 450);
+}
+
+function populateChapterSelect(story) {
+  readerChapterSelect.replaceChildren();
+  story.chapters.forEach((chapter, index) => {
+    const option = document.createElement("option");
+    option.value = String(index);
+    option.textContent = `${index + 1}. ${chapter.title}`;
+    readerChapterSelect.append(option);
+  });
+}
+
+function syncChapterControls() {
+  if (!activeStory) return;
+  const chapterCount = activeStory.chapters.length;
+  const chapter = activeStory.chapters[activeChapterIndex];
+  const atStart = activeChapterIndex === 0;
+  const atEnd = activeChapterIndex === chapterCount - 1;
+
+  readerPrevButtons.forEach((button) => {
+    button.disabled = atStart;
+  });
+  readerNextButtons.forEach((button) => {
+    button.disabled = atEnd;
+  });
+
+  readerChapterSelect.value = String(activeChapterIndex);
+  readerChapterName.textContent = chapter.title;
+  readerChapterProgress.textContent = `Chapter ${activeChapterIndex + 1} of ${chapterCount}`;
+  readerAuthor.textContent = `${activeStory.author} · ${readerChapterProgress.textContent}`;
+}
+
+async function renderChapter(index, { scrollToTop = true } = {}) {
+  if (!activeStory) return;
+  activeChapterIndex = Math.max(0, Math.min(index, activeStory.chapters.length - 1));
+  const chapter = activeStory.chapters[activeChapterIndex];
+
+  disconnectFrameResize();
+  readerFrame.style.height = "1px";
+  readerFrame.srcdoc = buildReaderDocument(activeStory, chapter);
+  syncChapterControls();
+
+  activeStory.lastChapterIndex = activeChapterIndex;
+  saveStory(activeStory).catch((error) => console.warn("Could not save chapter position", error));
+  document.title = `${chapter.title} · ${activeStory.title} · Homeslop`;
+  setFooter(`CHAPTER ${activeChapterIndex + 1}/${activeStory.chapters.length}`);
+
+  if (scrollToTop) {
+    requestAnimationFrame(() => window.scrollTo({ top: 0, behavior: "instant" }));
+  }
 }
 
 async function importAO3Work(value) {
@@ -242,7 +552,7 @@ async function importAO3Work(value) {
       headers: { Accept: "text/html, application/json" },
     });
   } catch {
-    throw new Error("The import endpoint could not be reached. Deploy this repository on Cloudflare Pages to enable /api/import.");
+    throw new Error("The import endpoint could not be reached.");
   }
 
   const contentType = response.headers.get("content-type") || "";
@@ -250,19 +560,26 @@ async function importAO3Work(value) {
     let message = `Import failed with HTTP ${response.status}.`;
     if (contentType.includes("application/json")) {
       const payload = await response.json().catch(() => null);
-      if (payload?.error) message = payload.error;
+      if (payload?.error) message = readableError(payload.error);
     } else {
       const text = await response.text().catch(() => "");
-      if (text.trim()) message = text.trim().slice(0, 280);
+      if (text.trim()) message = text.trim().slice(0, 500);
     }
     throw new Error(message);
   }
 
-  setStatus("busy", "READING WORK", "page received; locating #workskin...");
+  setStatus("busy", "READING WORK", "page received; locating chapters...");
   const responseHtml = await response.text();
   const extracted = extractWork(responseHtml, url, workId);
-  setStatus("busy", "PRESERVING FORMAT", "captured work HTML and inline CSS.");
+  setStatus(
+    "busy",
+    "PRESERVING FORMAT",
+    `captured HTML, workskin CSS, and ${extracted.chapters.length} ${
+      extracted.chapters.length === 1 ? "chapter" : "chapters"
+    }.`,
+  );
 
+  const existing = await getStory(`ao3-${workId}`).catch(() => null);
   const story = {
     id: `ao3-${workId}`,
     source: "AO3",
@@ -272,11 +589,14 @@ async function importAO3Work(value) {
     author: extracted.author,
     workHtml: extracted.workHtml,
     inlineStyles: extracted.inlineStyles,
-    importedAt: new Date().toISOString(),
+    chapters: extracted.chapters,
+    lastChapterIndex: Math.min(existing?.lastChapterIndex || 0, extracted.chapters.length - 1),
+    importedAt: existing?.importedAt || new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
   };
 
   await saveStory(story);
-  setStatus("success", "IMPORT COMPLETE", `saved “${story.title}” locally.`);
+  setStatus("success", "IMPORT COMPLETE", `saved “${story.title}” chapter by chapter.`);
   setFooter("READY");
   await refreshLibrary();
   return story;
@@ -291,49 +611,60 @@ async function refreshLibrary() {
     console.error(error);
   }
 
-  stories.sort((a, b) => new Date(b.importedAt) - new Date(a.importedAt));
+  stories.sort((a, b) => new Date(b.updatedAt || b.importedAt) - new Date(a.updatedAt || a.importedAt));
   bookList.replaceChildren();
   bookCount.textContent = `${stories.length} ${stories.length === 1 ? "FILE" : "FILES"}`;
   emptyLibrary.hidden = stories.length > 0;
   bookList.hidden = stories.length === 0;
 
-  stories.forEach((story) => {
+  stories.forEach((storedStory) => {
+    const story = ensureStoryChapters(storedStory);
     const fragment = bookTemplate.content.cloneNode(true);
     const button = fragment.querySelector(".book-open");
+    const chapterCount = story.chapters.length;
     fragment.querySelector(".book-source").textContent = story.source || "LOCAL";
     fragment.querySelector(".book-title").textContent = story.title;
-    fragment.querySelector(".book-author").textContent = story.author ? `by ${story.author}` : "author unknown";
+    fragment.querySelector(".book-author").textContent = `by ${story.author || "Unknown"} · ${chapterCount} ${
+      chapterCount === 1 ? "chapter" : "chapters"
+    }`;
     button.addEventListener("click", () => openReader(story.id));
     bookList.append(fragment);
   });
 }
 
 async function openReader(id) {
-  const story = await getStory(id);
-  if (!story) return;
+  const storedStory = await getStory(id);
+  if (!storedStory) return;
 
-  activeStoryId = story.id;
-  readerTitle.textContent = story.title;
-  readerAuthor.textContent = story.author ? `${story.source} // ${story.author}` : story.source;
-  readerFrame.srcdoc = buildReaderDocument(story);
-  setFooter(`OPEN: ${story.title}`);
+  activeStory = ensureStoryChapters(storedStory);
+  activeChapterIndex = Math.min(activeStory.lastChapterIndex || 0, activeStory.chapters.length - 1);
+  readerTitle.textContent = activeStory.title;
+  populateChapterSelect(activeStory);
   showView("reader");
+  await saveStory(activeStory).catch(() => {});
+  await renderChapter(activeChapterIndex, { scrollToTop: true });
 }
 
 async function deleteActiveStory() {
-  if (!activeStoryId) return;
-  const story = await getStory(activeStoryId);
-  if (!story) return;
-
-  const confirmed = window.confirm(`Delete “${story.title}” from this device?`);
+  if (!activeStory) return;
+  const confirmed = window.confirm(`Delete “${activeStory.title}” from this device?`);
   if (!confirmed) return;
 
-  await removeStory(activeStoryId);
-  activeStoryId = null;
+  await removeStory(activeStory.id);
+  activeStory = null;
+  activeChapterIndex = 0;
   readerFrame.srcdoc = "";
+  document.title = "Homeslop";
   await refreshLibrary();
   setFooter("DELETED");
   showView("library");
+}
+
+function changeChapter(delta) {
+  if (!activeStory) return;
+  const nextIndex = activeChapterIndex + delta;
+  if (nextIndex < 0 || nextIndex >= activeStory.chapters.length) return;
+  renderChapter(nextIndex, { scrollToTop: true });
 }
 
 tabs.forEach((tab) => {
@@ -352,13 +683,23 @@ document.querySelectorAll("[data-go-import]").forEach((button) => {
 });
 
 document.querySelector("#reader-back").addEventListener("click", () => {
-  activeStoryId = null;
+  activeStory = null;
+  activeChapterIndex = 0;
   readerFrame.srcdoc = "";
+  document.title = "Homeslop";
   setFooter("READY");
   showView("library");
 });
 
 readerDelete.addEventListener("click", deleteActiveStory);
+readerPrevButtons.forEach((button) => button.addEventListener("click", () => changeChapter(-1)));
+readerNextButtons.forEach((button) => button.addEventListener("click", () => changeChapter(1)));
+readerChapterSelect.addEventListener("change", () => {
+  renderChapter(Number(readerChapterSelect.value), { scrollToTop: true });
+});
+readerFrame.addEventListener("load", prepareReaderFrame);
+window.addEventListener("resize", resizeReaderFrame);
+window.addEventListener("orientationchange", () => setTimeout(resizeReaderFrame, 150));
 
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -366,10 +707,10 @@ form.addEventListener("submit", async (event) => {
 
   try {
     const story = await importAO3Work(urlInput.value);
-    setTimeout(() => openReader(story.id), 450);
+    setTimeout(() => openReader(story.id), 350);
   } catch (error) {
     console.error(error);
-    setStatus("error", "IMPORT FAILED", error instanceof Error ? error.message : "Unknown import error.");
+    setStatus("error", "IMPORT FAILED", error instanceof Error ? error.message : readableError(error));
     setFooter("ERROR");
   } finally {
     importButton.disabled = false;
