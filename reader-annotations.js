@@ -1,194 +1,464 @@
-const ANNOTATION_KEY = "homeslop-annotations-v1";
-const HIGHLIGHT_ATTR = "data-homeslop-highlight-id";
-const NOTE_PIN_ATTR = "data-homeslop-note-pin";
-const TOOLBAR_ID = "homeslop-selection-toolbar";
-const EDITOR_ID = "homeslop-annotation-editor";
+const ANNOTATION_STORAGE_KEY = "homeslop-annotations-v1";
+const ANNOTATION_SEGMENT_ATTR = "data-homeslop-annotation-id";
+const ANNOTATION_UI_ATTR = "data-homeslop-annotation-ui";
+const ANNOTATIONS_HIDDEN_KEY = "homeslop-annotations-hidden";
 
-let annotations = loadAnnotations();
-let pendingAnchor = null;
-let activeAnnotationId = null;
+const readerView = document.querySelector("#reader-view");
+const readerTopbar = document.querySelector(".reader-topbar");
+const readerDelete = document.querySelector("#reader-delete");
+
 let shadowObserver = null;
 let shellObserver = null;
-let renderFrame = 0;
+let activeShadow = null;
+let applying = false;
+let applyFrame = 0;
 let selectionTimer = 0;
-let currentShadow = null;
+let pendingSelection = null;
+let activeEditorId = null;
 let lastClickedStoryId = null;
 
 function loadAnnotations() {
   try {
-    const parsed = JSON.parse(localStorage.getItem(ANNOTATION_KEY) || "[]");
+    const parsed = JSON.parse(localStorage.getItem(ANNOTATION_STORAGE_KEY) || "[]");
     return Array.isArray(parsed) ? parsed : [];
   } catch {
     return [];
   }
 }
 
+let annotations = loadAnnotations();
+
 function persistAnnotations() {
-  localStorage.setItem(ANNOTATION_KEY, JSON.stringify(annotations));
+  try {
+    localStorage.setItem(ANNOTATION_STORAGE_KEY, JSON.stringify(annotations));
+  } catch (error) {
+    console.warn("Homeslop could not save annotations", error);
+  }
 }
 
-function normalize(value) {
-  return String(value || "").replace(/\s+/g, " ").trim();
+function annotationId() {
+  return crypto.randomUUID?.() || `note-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
-function storyKey() {
-  const readerView = document.querySelector("#reader-view");
-  if (readerView?.dataset.storyId) return readerView.dataset.storyId;
-  if (lastClickedStoryId) return lastClickedStoryId;
-
-  const title = normalize(document.querySelector("#reader-title")?.textContent);
-  const author = normalize(document.querySelector("#reader-author")?.textContent)
-    .replace(/\s*·\s*Chapter\s+\d+.*$/i, "");
-  return `fallback:${title}|${author}`;
+function currentContext() {
+  const explicitStoryId = readerView?.dataset.storyId || lastClickedStoryId || "";
+  const fallbackTitle = String(document.querySelector("#reader-title")?.textContent || "")
+    .replace(/\s+/g, " ")
+    .trim();
+  const fallbackAuthor = String(document.querySelector("#reader-author")?.textContent || "")
+    .replace(/\s*·\s*Chapter\s+\d+.*$/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  const storyId = explicitStoryId || (fallbackTitle ? `fallback:${fallbackTitle}|${fallbackAuthor}` : "");
+  const selectedChapter = Number(document.querySelector("#reader-chapter-select")?.value);
+  const datasetChapter = Number(readerView?.dataset.chapterIndex);
+  const chapterIndex = Number.isFinite(datasetChapter) ? datasetChapter : Math.max(0, selectedChapter || 0);
+  if (!storyId || !Number.isFinite(chapterIndex)) return null;
+  return { storyId, chapterIndex };
 }
 
-function chapterIndex() {
-  return Math.max(0, Number(document.querySelector("#reader-chapter-select")?.value) || 0);
-}
-
-function chapterAnnotations() {
-  const key = storyKey();
-  const chapter = chapterIndex();
+function currentAnnotations() {
+  const context = currentContext();
+  if (!context) return [];
   return annotations.filter(
-    (annotation) => annotation.storyKey === key && Number(annotation.chapterIndex) === chapter,
+    (annotation) =>
+      annotation.storyId === context.storyId && annotation.chapterIndex === context.chapterIndex,
   );
 }
 
-function shouldIgnoreTextNode(node) {
-  const parent = node.parentElement;
-  if (!parent || !node.nodeValue) return true;
-  return Boolean(
-    parent.closest(
-      "script, style, noscript, button, select, textarea, input, [aria-hidden='true'], .homeslop-song-hidden-link",
-    ),
-  );
-}
-
-function flatten(root) {
+function textNodes(root) {
+  const nodes = [];
   const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
     acceptNode(node) {
-      return shouldIgnoreTextNode(node) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT;
+      if (!node.data) return NodeFilter.FILTER_REJECT;
+      const parent = node.parentElement;
+      if (!parent) return NodeFilter.FILTER_REJECT;
+      if (parent.closest(`script, style, [${ANNOTATION_UI_ATTR}]`)) {
+        return NodeFilter.FILTER_REJECT;
+      }
+      return NodeFilter.FILTER_ACCEPT;
     },
   });
 
-  const nodes = [];
-  let text = "";
-  let node;
-  while ((node = walker.nextNode())) {
-    const start = text.length;
-    text += node.nodeValue;
-    nodes.push({ node, start, end: text.length });
+  while (walker.nextNode()) nodes.push(walker.currentNode);
+  return nodes;
+}
+
+function offsetForBoundary(root, container, offset) {
+  const nodes = textNodes(root);
+  let total = 0;
+
+  for (const node of nodes) {
+    if (node === container) return total + Math.min(offset, node.data.length);
+    total += node.data.length;
   }
-  return { text, nodes };
+
+  try {
+    const range = document.createRange();
+    range.selectNodeContents(root);
+    range.setEnd(container, offset);
+    return range.toString().length;
+  } catch {
+    return null;
+  }
 }
 
-function rangeOffset(flat, container, offset) {
-  if (container?.nodeType !== Node.TEXT_NODE) return null;
-  const entry = flat.nodes.find((item) => item.node === container);
-  if (!entry) return null;
-  return entry.start + Math.min(offset, container.nodeValue.length);
+function selectionInsideWorkskin(shadow) {
+  const selection = shadow.getSelection?.() || window.getSelection();
+  const workskin = shadow.querySelector("#workskin");
+  if (!selection || selection.rangeCount === 0 || selection.isCollapsed || !workskin) return null;
+
+  const range = selection.getRangeAt(0);
+  const common = range.commonAncestorContainer;
+  const commonElement = common.nodeType === Node.ELEMENT_NODE ? common : common.parentElement;
+  if (!commonElement || !workskin.contains(commonElement)) return null;
+  if (commonElement.closest(`[${ANNOTATION_UI_ATTR}]`)) return null;
+
+  const start = offsetForBoundary(workskin, range.startContainer, range.startOffset);
+  const end = offsetForBoundary(workskin, range.endContainer, range.endOffset);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return null;
+
+  const quote = range.toString().replace(/\s+/g, " ").trim();
+  if (!quote || quote.length > 1200) return null;
+
+  return { range, start, end, quote, selection };
 }
 
-function selectionTouchesExistingHighlight(range, shadow) {
-  return [...shadow.querySelectorAll(`mark[${HIGHLIGHT_ATTR}]`)].some((mark) => {
-    try {
-      return range.intersectsNode(mark);
-    } catch {
-      return false;
+function ensureShellStyles() {
+  if (document.querySelector("#homeslop-annotation-shell-style")) return;
+  const style = document.createElement("style");
+  style.id = "homeslop-annotation-shell-style";
+  style.textContent = `
+    .reader-topbar {
+      grid-template-columns: 44px minmax(0, 1fr) auto auto auto !important;
     }
-  });
+
+    #homeslop-selection-tools {
+      position: fixed;
+      z-index: 11000;
+      display: none;
+      gap: .4rem;
+      padding: .4rem;
+      border: 1px solid #666;
+      border-radius: 7px;
+      background: #1d1d1d;
+      box-shadow: 0 7px 24px rgba(0, 0, 0, .45);
+    }
+
+    #homeslop-selection-tools[data-open="true"] { display: flex; }
+
+    #homeslop-selection-tools button,
+    #homeslop-annotation-editor button,
+    #homeslop-annotation-editor textarea {
+      font: inherit;
+    }
+
+    #homeslop-selection-tools button {
+      min-height: 2.2rem;
+      padding: .35rem .65rem;
+      border: 1px solid #777;
+      border-radius: 4px;
+      color: #eee;
+      background: #303030;
+      font-size: .76rem;
+      font-weight: 700;
+    }
+
+    #homeslop-annotation-editor {
+      position: fixed;
+      inset: auto max(.65rem, env(safe-area-inset-right)) calc(.65rem + env(safe-area-inset-bottom)) max(.65rem, env(safe-area-inset-left));
+      z-index: 11001;
+      display: none;
+      max-width: 42rem;
+      max-height: min(70svh, 36rem);
+      margin-inline: auto;
+      overflow: auto;
+      border: 2px solid #777;
+      border-radius: 9px;
+      background: #181818;
+      color: #eee;
+      box-shadow: 0 12px 42px rgba(0, 0, 0, .55);
+      font-family: "Lucida Grande", "Lucida Sans Unicode", Verdana, Helvetica, Arial, sans-serif;
+    }
+
+    #homeslop-annotation-editor[data-open="true"] { display: block; }
+
+    #homeslop-annotation-editor .annotation-editor-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: .75rem;
+      padding: .65rem .75rem;
+      border-bottom: 1px solid #444;
+      background: #242424;
+    }
+
+    #homeslop-annotation-editor .annotation-editor-body {
+      display: grid;
+      gap: .7rem;
+      padding: .75rem;
+    }
+
+    #homeslop-annotation-editor .annotation-quote {
+      margin: 0;
+      padding: .55rem .65rem;
+      border-left: 3px solid #f7b500;
+      color: #cfcfcf;
+      background: #202020;
+      font-size: .84rem;
+      line-height: 1.45;
+    }
+
+    #homeslop-annotation-editor textarea {
+      width: 100%;
+      min-height: 7rem;
+      resize: vertical;
+      padding: .65rem;
+      border: 1px solid #666;
+      border-radius: 5px;
+      color: #eee;
+      background: #111;
+      font-size: 1rem;
+      line-height: 1.45;
+    }
+
+    #homeslop-annotation-editor .annotation-palette,
+    #homeslop-annotation-editor .annotation-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: .5rem;
+    }
+
+    #homeslop-annotation-editor .annotation-color {
+      width: 2.25rem;
+      height: 2.25rem;
+      border: 2px solid transparent;
+      border-radius: 999px;
+    }
+
+    #homeslop-annotation-editor .annotation-color[aria-pressed="true"] {
+      border-color: #fff;
+      box-shadow: 0 0 0 2px #111;
+    }
+
+    #homeslop-annotation-editor .annotation-color[data-color="yellow"] { background: #ffe05d; }
+    #homeslop-annotation-editor .annotation-color[data-color="pink"] { background: #ff8fb7; }
+    #homeslop-annotation-editor .annotation-color[data-color="blue"] { background: #82c8ff; }
+    #homeslop-annotation-editor .annotation-color[data-color="green"] { background: #8fdda4; }
+
+    #homeslop-annotation-editor .annotation-actions button,
+    #homeslop-annotation-editor .annotation-editor-close {
+      min-height: 2.25rem;
+      padding: .4rem .7rem;
+      border: 1px solid #666;
+      border-radius: 4px;
+      color: #eee;
+      background: #303030;
+      font-weight: 700;
+    }
+
+    #homeslop-annotation-editor .annotation-save { background: #6a4a00; border-color: #f7b500; }
+    #homeslop-annotation-editor .annotation-delete { color: #ffafbc; }
+  `;
+  document.head.append(style);
 }
 
-function anchorFromSelection(range, workskin, shadow) {
-  const quote = range.toString();
-  if (!normalize(quote) || quote.length > 1800) return null;
-  if (selectionTouchesExistingHighlight(range, shadow)) return null;
+function ensureSelectionTools() {
+  let tools = document.querySelector("#homeslop-selection-tools");
+  if (tools) return tools;
 
-  const flat = flatten(workskin);
-  let start = rangeOffset(flat, range.startContainer, range.startOffset);
-  let end = rangeOffset(flat, range.endContainer, range.endOffset);
+  ensureShellStyles();
+  tools = document.createElement("div");
+  tools.id = "homeslop-selection-tools";
+  tools.dataset.open = "false";
+  tools.setAttribute(ANNOTATION_UI_ATTR, "");
 
-  if (start == null || end == null || end <= start || flat.text.slice(start, end) !== quote) {
-    start = flat.text.indexOf(quote);
-    if (start < 0) return null;
-    end = start + quote.length;
+  const highlight = document.createElement("button");
+  highlight.type = "button";
+  highlight.textContent = "HIGHLIGHT";
+  highlight.addEventListener("pointerdown", (event) => event.preventDefault());
+  highlight.addEventListener("click", () => createFromPending(false));
+
+  const note = document.createElement("button");
+  note.type = "button";
+  note.textContent = "+ NOTE";
+  note.addEventListener("pointerdown", (event) => event.preventDefault());
+  note.addEventListener("click", () => createFromPending(true));
+
+  tools.append(highlight, note);
+  document.body.append(tools);
+  return tools;
+}
+
+function hideSelectionTools() {
+  const tools = document.querySelector("#homeslop-selection-tools");
+  if (tools) tools.dataset.open = "false";
+  pendingSelection = null;
+}
+
+function showSelectionTools() {
+  if (!activeShadow || !readerView?.classList.contains("is-visible")) return;
+  const selected = selectionInsideWorkskin(activeShadow);
+  if (!selected) {
+    hideSelectionTools();
+    return;
   }
 
-  const matchesBefore = flat.text.slice(0, start).split(quote).length - 1;
-  return {
-    quote,
-    prefix: flat.text.slice(Math.max(0, start - 48), start),
-    suffix: flat.text.slice(end, end + 48),
-    occurrence: Math.max(0, matchesBefore),
+  const context = currentContext();
+  if (!context) return;
+
+  const rect = selected.range.getBoundingClientRect();
+  if (!rect || (!rect.width && !rect.height)) return;
+
+  pendingSelection = {
+    ...context,
+    start: selected.start,
+    end: selected.end,
+    quote: selected.quote,
   };
+
+  const tools = ensureSelectionTools();
+  tools.dataset.open = "true";
+  const width = tools.offsetWidth || 170;
+  const left = Math.max(8, Math.min(window.innerWidth - width - 8, rect.left + rect.width / 2 - width / 2));
+  const top = rect.top > 70 ? rect.top - 52 : rect.bottom + 10;
+  tools.style.left = `${left}px`;
+  tools.style.top = `${Math.max(8, top)}px`;
 }
 
-function findQuote(text, annotation) {
-  const quote = String(annotation.quote || "");
-  if (!quote) return -1;
+function scheduleSelectionTools(delay = 140) {
+  if (selectionTimer) clearTimeout(selectionTimer);
+  selectionTimer = window.setTimeout(showSelectionTools, delay);
+}
 
-  const matches = [];
-  let cursor = 0;
-  while (cursor <= text.length - quote.length) {
-    const index = text.indexOf(quote, cursor);
-    if (index < 0) break;
-    matches.push(index);
-    cursor = index + Math.max(1, quote.length);
+function overlappingAnnotation(selection) {
+  return annotations.find(
+    (annotation) =>
+      annotation.storyId === selection.storyId &&
+      annotation.chapterIndex === selection.chapterIndex &&
+      selection.start < annotation.end &&
+      selection.end > annotation.start,
+  );
+}
+
+function createFromPending(withNote) {
+  if (!pendingSelection) return;
+  const overlap = overlappingAnnotation(pendingSelection);
+  if (overlap) {
+    hideSelectionTools();
+    openEditor(overlap.id);
+    return;
   }
-  if (!matches.length) return -1;
 
-  let best = matches[Math.min(annotation.occurrence || 0, matches.length - 1)];
-  let bestScore = -1;
-  matches.forEach((index) => {
-    const left = text.slice(Math.max(0, index - annotation.prefix.length), index);
-    const right = text.slice(index + quote.length, index + quote.length + annotation.suffix.length);
-    let score = 0;
+  const annotation = {
+    id: annotationId(),
+    storyId: pendingSelection.storyId,
+    chapterIndex: pendingSelection.chapterIndex,
+    start: pendingSelection.start,
+    end: pendingSelection.end,
+    quote: pendingSelection.quote,
+    note: "",
+    color: "yellow",
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
 
-    for (let i = 1; i <= Math.min(left.length, annotation.prefix.length); i += 1) {
-      if (left.at(-i) !== annotation.prefix.at(-i)) break;
-      score += 1;
-    }
-    for (let i = 0; i < Math.min(right.length, annotation.suffix.length); i += 1) {
-      if (right[i] !== annotation.suffix[i]) break;
-      score += 1;
-    }
-
-    if (score > bestScore) {
-      bestScore = score;
-      best = index;
-    }
-  });
-  return best;
+  annotations.push(annotation);
+  persistAnnotations();
+  window.getSelection()?.removeAllRanges();
+  hideSelectionTools();
+  applyAnnotations();
+  if (withNote) openEditor(annotation.id, true);
 }
 
-function unwrapHighlights(workskin) {
-  workskin.querySelectorAll(`mark[${HIGHLIGHT_ATTR}]`).forEach((mark) => {
-    mark.replaceWith(...mark.childNodes);
-  });
-  workskin.normalize();
-}
+function ensureEditor() {
+  let editor = document.querySelector("#homeslop-annotation-editor");
+  if (editor) return editor;
 
-function wrapInterval(flat, start, end, annotation) {
-  flat.nodes
-    .filter((entry) => entry.end > start && entry.start < end)
-    .reverse()
-    .forEach((entry) => {
-      if (!entry.node.parentNode) return;
-      const from = Math.max(0, start - entry.start);
-      const to = Math.min(entry.node.nodeValue.length, end - entry.start);
-      if (to <= from) return;
+  ensureShellStyles();
+  editor = document.createElement("aside");
+  editor.id = "homeslop-annotation-editor";
+  editor.dataset.open = "false";
+  editor.setAttribute(ANNOTATION_UI_ATTR, "");
+  editor.setAttribute("aria-label", "Annotation editor");
+  editor.innerHTML = `
+    <div class="annotation-editor-head">
+      <strong>PAGE NOTE</strong>
+      <button class="annotation-editor-close" type="button" aria-label="Close annotation editor">×</button>
+    </div>
+    <div class="annotation-editor-body">
+      <blockquote class="annotation-quote"></blockquote>
+      <textarea class="annotation-note" placeholder="Write a note…"></textarea>
+      <div class="annotation-palette" aria-label="Highlight color">
+        <button class="annotation-color" data-color="yellow" type="button" aria-label="Yellow highlight"></button>
+        <button class="annotation-color" data-color="pink" type="button" aria-label="Pink highlight"></button>
+        <button class="annotation-color" data-color="blue" type="button" aria-label="Blue highlight"></button>
+        <button class="annotation-color" data-color="green" type="button" aria-label="Green highlight"></button>
+      </div>
+      <div class="annotation-actions">
+        <button class="annotation-save" type="button">SAVE</button>
+        <button class="annotation-delete" type="button">DELETE</button>
+      </div>
+    </div>
+  `;
 
-      const range = document.createRange();
-      range.setStart(entry.node, from);
-      range.setEnd(entry.node, to);
-      const mark = document.createElement("mark");
-      mark.setAttribute(HIGHLIGHT_ATTR, annotation.id);
-      try {
-        range.surroundContents(mark);
-      } catch {
-        return;
-      }
+  editor.querySelector(".annotation-editor-close").addEventListener("click", closeEditor);
+  editor.querySelector(".annotation-save").addEventListener("click", saveEditor);
+  editor.querySelector(".annotation-delete").addEventListener("click", deleteEditorAnnotation);
+  editor.querySelectorAll(".annotation-color").forEach((button) => {
+    button.addEventListener("click", () => {
+      editor.querySelectorAll(".annotation-color").forEach((item) => {
+        item.setAttribute("aria-pressed", String(item === button));
+      });
     });
+  });
+
+  document.body.append(editor);
+  return editor;
+}
+
+function openEditor(id, focusNote = false) {
+  const annotation = annotations.find((item) => item.id === id);
+  if (!annotation) return;
+
+  hideSelectionTools();
+  activeEditorId = id;
+  const editor = ensureEditor();
+  editor.querySelector(".annotation-quote").textContent = annotation.quote;
+  editor.querySelector(".annotation-note").value = annotation.note || "";
+  editor.querySelectorAll(".annotation-color").forEach((button) => {
+    button.setAttribute("aria-pressed", String(button.dataset.color === annotation.color));
+  });
+  editor.dataset.open = "true";
+  if (focusNote) window.setTimeout(() => editor.querySelector(".annotation-note").focus(), 50);
+}
+
+function closeEditor() {
+  const editor = document.querySelector("#homeslop-annotation-editor");
+  if (editor) editor.dataset.open = "false";
+  activeEditorId = null;
+}
+
+function saveEditor() {
+  const editor = ensureEditor();
+  const annotation = annotations.find((item) => item.id === activeEditorId);
+  if (!annotation) return;
+
+  annotation.note = editor.querySelector(".annotation-note").value.trim();
+  annotation.color =
+    editor.querySelector('.annotation-color[aria-pressed="true"]')?.dataset.color || "yellow";
+  annotation.updatedAt = new Date().toISOString();
+  persistAnnotations();
+  closeEditor();
+  applyAnnotations();
+}
+
+function deleteEditorAnnotation() {
+  if (!activeEditorId) return;
+  annotations = annotations.filter((annotation) => annotation.id !== activeEditorId);
+  persistAnnotations();
+  closeEditor();
+  applyAnnotations();
 }
 
 function installShadowStyles(shadow) {
@@ -196,351 +466,237 @@ function installShadowStyles(shadow) {
   const style = document.createElement("style");
   style.id = "homeslop-annotation-style";
   style.textContent = `
-    mark[${HIGHLIGHT_ATTR}] {
-      padding: .04em .02em;
-      border-radius: .12em;
-      color: inherit !important;
-      background: rgba(255, 214, 10, .38) !important;
+    [${ANNOTATION_SEGMENT_ATTR}] {
+      border-radius: .14em;
+      color: inherit;
       box-decoration-break: clone;
       -webkit-box-decoration-break: clone;
       cursor: pointer;
     }
-    :host(:not([data-theme="dark"])) mark[${HIGHLIGHT_ATTR}] {
-      background: rgba(255, 218, 52, .5) !important;
-    }
-    mark[${NOTE_PIN_ATTR}]::after {
-      content: "✎";
+
+    [${ANNOTATION_SEGMENT_ATTR}][data-annotation-color="yellow"] { background: rgba(255, 224, 93, .48); }
+    [${ANNOTATION_SEGMENT_ATTR}][data-annotation-color="pink"] { background: rgba(255, 143, 183, .44); }
+    [${ANNOTATION_SEGMENT_ATTR}][data-annotation-color="blue"] { background: rgba(130, 200, 255, .42); }
+    [${ANNOTATION_SEGMENT_ATTR}][data-annotation-color="green"] { background: rgba(143, 221, 164, .42); }
+
+    .homeslop-annotation-pin {
       display: inline-grid;
       place-items: center;
-      width: 1.35em;
-      height: 1.35em;
-      margin-left: .18em;
+      min-width: 1.65em;
+      min-height: 1.65em;
+      margin-left: .25em;
+      padding: 0 .3em;
+      vertical-align: .08em;
       border: 1px solid currentColor;
-      border-radius: 50%;
-      color: #171717;
-      background: #ffd83d;
-      font: 700 .72em/1 "Courier New", monospace;
-      vertical-align: .28em;
-      box-shadow: 1px 1px 0 rgba(0,0,0,.3);
+      border-radius: 999px;
+      color: inherit;
+      background: color-mix(in srgb, currentColor 11%, var(--reader-bg));
+      font: inherit;
+      font-size: .75em;
+      line-height: 1;
+      cursor: pointer;
+    }
+
+    :host([data-annotations-hidden="true"]) [${ANNOTATION_SEGMENT_ATTR}] {
+      background: transparent !important;
+    }
+
+    :host([data-annotations-hidden="true"]) .homeslop-annotation-pin {
+      display: none !important;
     }
   `;
   shadow.append(style);
 }
 
-function observeShadow(shadow) {
-  shadowObserver?.disconnect();
-  shadowObserver = new MutationObserver(scheduleRender);
-  shadowObserver.observe(shadow, { childList: true, subtree: true });
+function unwrapAnnotations(root) {
+  root.querySelectorAll(`.homeslop-annotation-pin[${ANNOTATION_UI_ATTR}]`).forEach((pin) => pin.remove());
+  root.querySelectorAll(`[${ANNOTATION_SEGMENT_ATTR}]`).forEach((segment) => {
+    segment.replaceWith(...segment.childNodes);
+  });
+  root.normalize();
 }
 
-function renderAnnotations() {
-  renderFrame = 0;
-  const shadow = document.querySelector("#reader-shadow")?.shadowRoot;
-  const workskin = shadow?.querySelector("#workskin");
-  if (!shadow || !workskin) return;
+function applyAnnotation(root, annotation) {
+  const nodes = textNodes(root);
+  const segments = [];
+  let cursor = 0;
 
+  for (const node of nodes) {
+    const nodeStart = cursor;
+    const nodeEnd = cursor + node.data.length;
+    cursor = nodeEnd;
+    if (annotation.end <= nodeStart || annotation.start >= nodeEnd) continue;
+
+    segments.push({
+      node,
+      start: Math.max(0, annotation.start - nodeStart),
+      end: Math.min(node.data.length, annotation.end - nodeStart),
+    });
+  }
+
+  const wrappers = [];
+  [...segments].reverse().forEach(({ node, start, end }) => {
+    let selectedNode = node;
+    if (end < selectedNode.data.length) selectedNode.splitText(end);
+    if (start > 0) selectedNode = selectedNode.splitText(start);
+    if (!selectedNode.data) return;
+
+    const wrapper = document.createElement("span");
+    wrapper.setAttribute(ANNOTATION_SEGMENT_ATTR, annotation.id);
+    wrapper.dataset.annotationColor = annotation.color || "yellow";
+    wrapper.title = annotation.note || "Highlight";
+    selectedNode.parentNode.insertBefore(wrapper, selectedNode);
+    wrapper.append(selectedNode);
+    wrappers.push(wrapper);
+  });
+
+  if (!wrappers.length || !annotation.note) return;
+  const lastWrapper = wrappers[0];
+  const pin = document.createElement("button");
+  pin.className = "homeslop-annotation-pin";
+  pin.type = "button";
+  pin.textContent = "✎";
+  pin.title = annotation.note;
+  pin.setAttribute("aria-label", "Open annotation");
+  pin.setAttribute(ANNOTATION_UI_ATTR, "");
+  pin.dataset.annotationId = annotation.id;
+  lastWrapper.after(pin);
+}
+
+function applyAnnotations() {
+  applyFrame = 0;
+  if (applying || !activeShadow) return;
+  const workskin = activeShadow.querySelector("#workskin");
+  if (!workskin) return;
+
+  applying = true;
   shadowObserver?.disconnect();
   try {
-    installShadowStyles(shadow);
-    unwrapHighlights(workskin);
-    const flat = flatten(workskin);
-    const located = chapterAnnotations()
-      .map((annotation) => {
-        const start = findQuote(flat.text, annotation);
-        return start < 0 ? null : { annotation, start, end: start + annotation.quote.length };
-      })
-      .filter(Boolean)
-      .sort((a, b) => a.start - b.start || a.end - b.end);
-
-    const accepted = [];
-    let occupiedUntil = -1;
-    located.forEach((item) => {
-      if (item.start < occupiedUntil) return;
-      accepted.push(item);
-      occupiedUntil = item.end;
-    });
-
-    [...accepted].reverse().forEach((item) => {
-      wrapInterval(flat, item.start, item.end, item.annotation);
-    });
-
-    accepted.forEach(({ annotation }) => {
-      if (!annotation.note) return;
-      const fragments = workskin.querySelectorAll(
-        `mark[${HIGHLIGHT_ATTR}="${CSS.escape(annotation.id)}"]`,
-      );
-      fragments[fragments.length - 1]?.setAttribute(NOTE_PIN_ATTR, "");
-    });
+    installShadowStyles(activeShadow);
+    unwrapAnnotations(workskin);
+    currentAnnotations()
+      .filter((annotation) => annotation.end > annotation.start)
+      .sort((a, b) => b.start - a.start)
+      .forEach((annotation) => applyAnnotation(workskin, annotation));
   } finally {
-    observeShadow(shadow);
+    applying = false;
+    if (shadowObserver && activeShadow) {
+      shadowObserver.observe(activeShadow, { childList: true, subtree: true });
+    }
   }
 }
 
-function scheduleRender() {
-  if (renderFrame) cancelAnimationFrame(renderFrame);
-  renderFrame = requestAnimationFrame(renderAnnotations);
+function scheduleApply() {
+  if (applyFrame) cancelAnimationFrame(applyFrame);
+  applyFrame = requestAnimationFrame(applyAnnotations);
 }
 
-function installMainStyles() {
-  if (document.querySelector("#homeslop-annotation-main-style")) return;
-  const style = document.createElement("style");
-  style.id = "homeslop-annotation-main-style";
-  style.textContent = `
-    #${TOOLBAR_ID} {
-      position: fixed;
-      left: 50%;
-      bottom: calc(.8rem + env(safe-area-inset-bottom));
-      z-index: 10030;
-      display: none;
-      transform: translateX(-50%);
-      gap: .35rem;
-      padding: .42rem;
-      border: 2px solid #777;
-      border-radius: 7px;
-      background: #1c1c1c;
-      box-shadow: 0 10px 30px rgba(0,0,0,.55);
-    }
-    #${TOOLBAR_ID}[data-open="true"] { display: flex; }
-    #${TOOLBAR_ID} button,
-    #${EDITOR_ID} button {
-      min-height: 2.35rem;
-      padding: .42rem .65rem;
-      border: 1px solid #666;
-      border-radius: 4px;
-      color: #eee;
-      background: #303030;
-      font: 700 .72rem/1 "Courier New", monospace;
-    }
-    #${TOOLBAR_ID} .annotation-primary,
-    #${EDITOR_ID} .annotation-save {
-      color: #171717;
-      background: #ffd83d;
-      border-color: #c8a500;
-    }
-    #${EDITOR_ID} {
-      position: fixed;
-      left: max(.6rem, env(safe-area-inset-left));
-      right: max(.6rem, env(safe-area-inset-right));
-      bottom: calc(.6rem + env(safe-area-inset-bottom));
-      z-index: 10040;
-      display: none;
-      max-width: 40rem;
-      margin-inline: auto;
-      padding: .8rem;
-      border: 2px solid #777;
-      border-radius: 8px;
-      color: #eee;
-      background: #181818;
-      box-shadow: 0 14px 40px rgba(0,0,0,.65);
-      font-family: "Lucida Grande", Verdana, sans-serif;
-    }
-    #${EDITOR_ID}[data-open="true"] { display: block; }
-    #${EDITOR_ID} .annotation-quote {
-      max-height: 6rem;
-      margin: 0 0 .65rem;
-      padding: .55rem;
-      overflow: auto;
-      border-left: 4px solid #ffd83d;
-      color: #bbb;
-      background: #101010;
-      font-size: .78rem;
-      line-height: 1.45;
-    }
-    #${EDITOR_ID} textarea {
-      width: 100%;
-      min-height: 7rem;
-      padding: .65rem;
-      box-sizing: border-box;
-      resize: vertical;
-      border: 1px solid #666;
-      border-radius: 4px;
-      color: #eee;
-      background: #0e0e0e;
-      font: 1rem/1.45 "Lucida Grande", Verdana, sans-serif;
-    }
-    #${EDITOR_ID} .annotation-actions { display: flex; gap: .4rem; margin-top: .55rem; }
-    #${EDITOR_ID} .annotation-delete { margin-left: auto; color: #ff9bac; }
-  `;
-  document.head.append(style);
+function handleShadowClick(event) {
+  const segment = event.target.closest?.(`[${ANNOTATION_SEGMENT_ATTR}]`);
+  const pin = event.target.closest?.(".homeslop-annotation-pin");
+  const id = segment?.getAttribute(ANNOTATION_SEGMENT_ATTR) || pin?.dataset.annotationId;
+  if (!id) return;
+  event.preventDefault();
+  event.stopPropagation();
+  openEditor(id);
 }
 
-function ensureToolbar() {
-  let toolbar = document.getElementById(TOOLBAR_ID);
-  if (toolbar) return toolbar;
-  installMainStyles();
-  toolbar = document.createElement("div");
-  toolbar.id = TOOLBAR_ID;
-  toolbar.dataset.open = "false";
-  toolbar.innerHTML = `
-    <button class="annotation-primary" type="button" data-action="highlight">HIGHLIGHT</button>
-    <button type="button" data-action="note">ADD NOTE</button>
-    <button type="button" data-action="cancel" aria-label="Cancel">×</button>
-  `;
-  document.body.append(toolbar);
-  toolbar.querySelector('[data-action="highlight"]').addEventListener("click", () => createAnnotation(false));
-  toolbar.querySelector('[data-action="note"]').addEventListener("click", () => createAnnotation(true));
-  toolbar.querySelector('[data-action="cancel"]').addEventListener("click", hideToolbar);
-  return toolbar;
+function ensureVisibilityToggle() {
+  if (!readerTopbar || readerTopbar.querySelector(".homeslop-annotation-toggle")) return;
+  const button = document.createElement("button");
+  button.className = "reader-action homeslop-annotation-toggle";
+  button.type = "button";
+  button.textContent = "✎";
+  button.addEventListener("click", () => {
+    const hidden = localStorage.getItem(ANNOTATIONS_HIDDEN_KEY) !== "true";
+    localStorage.setItem(ANNOTATIONS_HIDDEN_KEY, String(hidden));
+    syncVisibility();
+  });
+  readerDelete?.before(button);
+  syncVisibility();
 }
 
-function ensureEditor() {
-  let editor = document.getElementById(EDITOR_ID);
-  if (editor) return editor;
-  installMainStyles();
-  editor = document.createElement("aside");
-  editor.id = EDITOR_ID;
-  editor.dataset.open = "false";
-  editor.innerHTML = `
-    <p class="annotation-quote"></p>
-    <textarea aria-label="Annotation" placeholder="Write in the margin…"></textarea>
-    <div class="annotation-actions">
-      <button class="annotation-save" type="button">SAVE NOTE</button>
-      <button class="annotation-close" type="button">CLOSE</button>
-      <button class="annotation-delete" type="button">DELETE</button>
-    </div>
-  `;
-  document.body.append(editor);
-  editor.querySelector(".annotation-save").addEventListener("click", saveNote);
-  editor.querySelector(".annotation-close").addEventListener("click", closeEditor);
-  editor.querySelector(".annotation-delete").addEventListener("click", deleteAnnotation);
-  return editor;
-}
-
-function hideToolbar() {
-  document.getElementById(TOOLBAR_ID)?.setAttribute("data-open", "false");
-  pendingAnchor = null;
-}
-
-function clearSelection() {
-  const shadow = document.querySelector("#reader-shadow")?.shadowRoot;
-  const selection = shadow?.getSelection?.() || document.getSelection();
-  selection?.removeAllRanges();
-}
-
-function createAnnotation(withNote) {
-  if (!pendingAnchor) return;
-  const annotation = {
-    id: crypto.randomUUID(),
-    storyKey: storyKey(),
-    chapterIndex: chapterIndex(),
-    ...pendingAnchor,
-    note: "",
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-  };
-  annotations.push(annotation);
-  persistAnnotations();
-  hideToolbar();
-  clearSelection();
-  scheduleRender();
-  if (withNote) setTimeout(() => openEditor(annotation.id), 80);
-}
-
-function openEditor(id) {
-  const annotation = annotations.find((item) => item.id === id);
-  if (!annotation) return;
-  const editor = ensureEditor();
-  activeAnnotationId = id;
-  editor.querySelector(".annotation-quote").textContent = annotation.quote;
-  editor.querySelector("textarea").value = annotation.note || "";
-  editor.dataset.open = "true";
-  setTimeout(() => editor.querySelector("textarea").focus(), 80);
-}
-
-function closeEditor() {
-  const editor = document.getElementById(EDITOR_ID);
-  if (editor) editor.dataset.open = "false";
-  activeAnnotationId = null;
-}
-
-function saveNote() {
-  const editor = document.getElementById(EDITOR_ID);
-  const annotation = annotations.find((item) => item.id === activeAnnotationId);
-  if (!editor || !annotation) return;
-  annotation.note = editor.querySelector("textarea").value.trim();
-  annotation.updatedAt = new Date().toISOString();
-  persistAnnotations();
-  closeEditor();
-  scheduleRender();
-}
-
-function deleteAnnotation() {
-  if (!activeAnnotationId) return;
-  if (!window.confirm("Delete this highlight and its note?")) return;
-  annotations = annotations.filter((item) => item.id !== activeAnnotationId);
-  persistAnnotations();
-  closeEditor();
-  scheduleRender();
-}
-
-function inspectSelection() {
-  const shadow = document.querySelector("#reader-shadow")?.shadowRoot;
-  const workskin = shadow?.querySelector("#workskin");
-  if (!shadow || !workskin) return;
-
-  const selection = shadow.getSelection?.()?.rangeCount
-    ? shadow.getSelection()
-    : document.getSelection();
-  if (!selection?.rangeCount || selection.isCollapsed || !normalize(selection.toString())) {
-    hideToolbar();
-    return;
+function syncVisibility() {
+  const host = document.querySelector("#reader-shadow");
+  const hidden = localStorage.getItem(ANNOTATIONS_HIDDEN_KEY) === "true";
+  if (host) host.dataset.annotationsHidden = String(hidden);
+  const button = readerTopbar?.querySelector(".homeslop-annotation-toggle");
+  if (button) {
+    button.textContent = hidden ? "✎̸" : "✎";
+    button.title = hidden ? "Show highlights and notes" : "Hide highlights and notes";
+    button.setAttribute(
+      "aria-label",
+      hidden ? "Show highlights and annotations" : "Hide highlights and annotations",
+    );
   }
-
-  const range = selection.getRangeAt(0);
-  if (range.commonAncestorContainer.getRootNode() !== shadow) return;
-  const container = range.commonAncestorContainer.nodeType === Node.ELEMENT_NODE
-    ? range.commonAncestorContainer
-    : range.commonAncestorContainer.parentElement;
-  if (!workskin.contains(container)) return;
-
-  const anchor = anchorFromSelection(range, workskin, shadow);
-  if (!anchor) {
-    hideToolbar();
-    return;
-  }
-
-  pendingAnchor = anchor;
-  ensureToolbar().dataset.open = "true";
 }
 
-function scheduleSelectionInspection(delay = 280) {
-  clearTimeout(selectionTimer);
-  selectionTimer = setTimeout(inspectSelection, delay);
-}
-
-function connectToShadow() {
+function connectShadow() {
   const shadow = document.querySelector("#reader-shadow")?.shadowRoot;
   if (!shadow) return false;
-  if (currentShadow === shadow) {
-    scheduleRender();
-    return true;
+
+  if (activeShadow !== shadow) {
+    activeShadow?.removeEventListener("click", handleShadowClick);
+    activeShadow = shadow;
+    activeShadow.addEventListener("click", handleShadowClick);
+    activeShadow.addEventListener("pointerup", () => scheduleSelectionTools(100));
+    activeShadow.addEventListener("touchend", () => scheduleSelectionTools(220), { passive: true });
+    activeShadow.addEventListener("keyup", () => scheduleSelectionTools(80));
   }
 
-  currentShadow = shadow;
-  installShadowStyles(shadow);
-  observeShadow(shadow);
-  shadow.addEventListener("pointerup", () => scheduleSelectionInspection(300));
-  shadow.addEventListener("keyup", () => scheduleSelectionInspection(80));
-  shadow.addEventListener("click", (event) => {
-    const mark = event.target.closest?.(`mark[${HIGHLIGHT_ATTR}]`);
-    if (mark) openEditor(mark.getAttribute(HIGHLIGHT_ATTR));
+  shadowObserver?.disconnect();
+  shadowObserver = new MutationObserver(() => {
+    if (!applying) scheduleApply();
   });
-  scheduleRender();
+  shadowObserver.observe(shadow, { childList: true, subtree: true });
+  syncVisibility();
+  scheduleApply();
   return true;
 }
 
 function connectWhenReady() {
-  if (connectToShadow()) {
+  if (connectShadow()) {
     shellObserver?.disconnect();
     shellObserver = null;
     return;
   }
+
   if (shellObserver) return;
   shellObserver = new MutationObserver(connectWhenReady);
   shellObserver.observe(document.body, { childList: true, subtree: true });
 }
 
-document.addEventListener("selectionchange", () => scheduleSelectionInspection(320));
+ensureShellStyles();
+ensureVisibilityToggle();
+connectWhenReady();
+
+new MutationObserver(() => {
+  hideSelectionTools();
+  closeEditor();
+  scheduleApply();
+}).observe(readerView, {
+  attributes: true,
+  attributeFilter: ["class", "data-story-id", "data-chapter-index"],
+});
+
+document.addEventListener("pointerdown", (event) => {
+  const tools = document.querySelector("#homeslop-selection-tools");
+  if (tools?.contains(event.target)) return;
+  if (document.querySelector("#homeslop-annotation-editor")?.contains(event.target)) return;
+  if (!event.composedPath().some((item) => item === document.querySelector("#reader-shadow"))) {
+    hideSelectionTools();
+  }
+});
+
+document.querySelector("#reader-back")?.addEventListener("click", () => {
+  hideSelectionTools();
+  closeEditor();
+});
+document.querySelector("#reader-delete")?.addEventListener("click", () => {
+  hideSelectionTools();
+  closeEditor();
+});
+
 document.addEventListener(
   "click",
   (event) => {
@@ -549,14 +705,7 @@ document.addEventListener(
   },
   true,
 );
-document.querySelector("#reader-chapter-select")?.addEventListener("change", () => {
-  hideToolbar();
-  closeEditor();
-  setTimeout(scheduleRender, 120);
-});
-document.querySelector("#reader-back")?.addEventListener("click", () => {
-  hideToolbar();
-  closeEditor();
-});
 
-connectWhenReady();
+document.addEventListener("selectionchange", () => {
+  if (readerView?.classList.contains("is-visible")) scheduleSelectionTools(260);
+});
