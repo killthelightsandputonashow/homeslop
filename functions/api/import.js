@@ -1,12 +1,24 @@
 const DEFAULT_UPSTREAM_IMPORTER =
   "https://homeslop-importer-killthelightsandp.vercel.app/api/import";
 
-function jsonError(error, status = 502, diagnostics = null) {
+function corsHeaders(request) {
+  const origin = request?.headers?.get?.("Origin") || "*";
+  return {
+    "Access-Control-Allow-Origin": origin === "null" ? "*" : origin,
+    "Access-Control-Allow-Methods": "GET, OPTIONS",
+    "Access-Control-Allow-Headers": "Accept, Content-Type",
+    "Access-Control-Max-Age": "86400",
+    Vary: "Origin",
+  };
+}
+
+function jsonError(error, status = 502, diagnostics = null, request = null) {
   return Response.json(
     { error, diagnostics },
     {
       status,
       headers: {
+        ...corsHeaders(request),
         "Cache-Control": "no-store",
         "X-Content-Type-Options": "nosniff",
         "X-Homeslop-Route": "cloudflare-relay",
@@ -32,12 +44,19 @@ function readableError(value) {
   return String(value || "Unknown upstream error.");
 }
 
+export async function onRequestOptions(context) {
+  return new Response(null, {
+    status: 204,
+    headers: corsHeaders(context.request),
+  });
+}
+
 export async function onRequestGet(context) {
   const requestUrl = new URL(context.request.url);
   const source = requestUrl.searchParams.get("url");
 
   if (!source) {
-    return jsonError("Missing the AO3 URL.", 400);
+    return jsonError("Missing the AO3 URL.", 400, null, context.request);
   }
 
   const upstreamBase = context.env.UPSTREAM_IMPORTER_URL || DEFAULT_UPSTREAM_IMPORTER;
@@ -47,7 +66,7 @@ export async function onRequestGet(context) {
     upstreamUrl = new URL(upstreamBase);
     upstreamUrl.searchParams.set("url", source);
   } catch {
-    return jsonError("Homeslop's external importer URL is misconfigured.", 500);
+    return jsonError("Homeslop's external importer URL is misconfigured.", 500, null, context.request);
   }
 
   const started = Date.now();
@@ -74,10 +93,11 @@ export async function onRequestGet(context) {
         errorName: error instanceof Error ? error.name : "UnknownError",
         errorMessage: error instanceof Error ? error.message : String(error),
       },
+      context.request,
     );
   }
 
-  const responseHeaders = new Headers();
+  const responseHeaders = new Headers(corsHeaders(context.request));
   const forwardedHeaders = [
     "content-type",
     "retry-after",
@@ -123,6 +143,7 @@ export async function onRequestGet(context) {
         durationMs: Date.now() - started,
         upstreamDiagnostics: upstreamPayload?.diagnostics || null,
       },
+      context.request,
     );
   }
 
