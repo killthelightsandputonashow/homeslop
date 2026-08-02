@@ -1,4 +1,4 @@
-const CACHE_NAME = "homeslop-shell-v21-stable-notes";
+const CACHE_NAME = "homeslop-shell-v22-readable-annotations";
 const APP_SHELL = [
   "./",
   "./index.html",
