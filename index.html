@@ -85,7 +85,7 @@
 
             <details class="compatibility-note">
               <summary>WHAT THIS BUILD PRESERVES</summary>
-              <p>Work HTML, classes, inline styles, and inline workskin CSS. External images, fonts, and linked music players may require internet.</p>
+              <p>Work HTML, classes, inline styles, and inline workskin CSS. External images and fonts may still require internet until offline asset saving is added.</p>
             </details>
           </div>
         </section>
@@ -145,6 +145,7 @@
       </article>
     </template>
 
+    <script type="module" src="./pwa-import-fix.js"></script>
     <script type="module" src="./app.js"></script>
     <script type="module" src="./reader-shadow.js"></script>
     <script type="module" src="./reader-mobile-layout.js"></script>
@@ -152,5 +153,8 @@
     <script type="module" src="./reader-fallback-format.js"></script>
     <script type="module" src="./reader-state.js"></script>
     <script type="module" src="./reader-music.js"></script>
+    <script type="module" src="./reader-music-detect.js"></script>
+    <script type="module" src="./reader-annotations.js"></script>
+    <script type="module" src="./backup.js"></script>
   </body>
 </html>
