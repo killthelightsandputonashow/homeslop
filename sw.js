@@ -1,4 +1,4 @@
-const CACHE_NAME = "homeslop-shell-v20-backup-music-notes";
+const CACHE_NAME = "homeslop-shell-v21-stable-notes";
 const APP_SHELL = [
   "./",
   "./index.html",
