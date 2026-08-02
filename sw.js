@@ -1,9 +1,10 @@
-const CACHE_NAME = "homeslop-shell-v19-music-player";
+const CACHE_NAME = "homeslop-shell-v20-backup-music-notes";
 const APP_SHELL = [
   "./",
   "./index.html",
   "./styles.css",
   "./visibility-fix.css",
+  "./pwa-import-fix.js",
   "./app.js",
   "./reader-shadow.js",
   "./reader-mobile-layout.js",
@@ -11,6 +12,9 @@ const APP_SHELL = [
   "./reader-fallback-format.js",
   "./reader-state.js",
   "./reader-music.js",
+  "./reader-music-detect.js",
+  "./reader-annotations.js",
+  "./backup.js",
   "./manifest.webmanifest",
   "./icon.svg"
 ];
@@ -27,6 +31,10 @@ self.addEventListener("activate", (event) => {
     ))
   );
   self.clients.claim();
+});
+
+self.addEventListener("message", (event) => {
+  if (event.data?.type === "SKIP_WAITING") self.skipWaiting();
 });
 
 self.addEventListener("fetch", (event) => {
