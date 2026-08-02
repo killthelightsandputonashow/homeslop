@@ -4,68 +4,57 @@ const NOTE_PIN_ATTR = "data-homeslop-note-pin";
 const TOOLBAR_ID = "homeslop-selection-toolbar";
 const EDITOR_ID = "homeslop-annotation-editor";
 
-let annotationStore = loadAnnotations();
+let annotations = loadAnnotations();
 let pendingAnchor = null;
 let activeAnnotationId = null;
-let annotationObserver = null;
-let annotationShellObserver = null;
-let annotationFrame = 0;
+let shadowObserver = null;
+let shellObserver = null;
+let renderFrame = 0;
 let selectionTimer = 0;
-let renderingAnnotations = false;
+let currentShadow = null;
 let lastClickedStoryId = null;
 
 function loadAnnotations() {
   try {
-    const value = JSON.parse(localStorage.getItem(ANNOTATION_KEY) || "[]");
-    return Array.isArray(value) ? value : [];
+    const parsed = JSON.parse(localStorage.getItem(ANNOTATION_KEY) || "[]");
+    return Array.isArray(parsed) ? parsed : [];
   } catch {
     return [];
   }
 }
 
-function saveAnnotations() {
-  try {
-    localStorage.setItem(ANNOTATION_KEY, JSON.stringify(annotationStore));
-  } catch (error) {
-    console.warn("Homeslop could not save annotations", error);
-  }
+function persistAnnotations() {
+  localStorage.setItem(ANNOTATION_KEY, JSON.stringify(annotations));
 }
 
 function normalize(value) {
   return String(value || "").replace(/\s+/g, " ").trim();
 }
 
-function currentStoryKey() {
+function storyKey() {
   const readerView = document.querySelector("#reader-view");
-  const explicit = readerView?.dataset.storyId || lastClickedStoryId;
-  if (explicit) return explicit;
+  if (readerView?.dataset.storyId) return readerView.dataset.storyId;
+  if (lastClickedStoryId) return lastClickedStoryId;
 
   const title = normalize(document.querySelector("#reader-title")?.textContent);
-  const author = normalize(document.querySelector("#reader-author")?.textContent).replace(/\s*·\s*Chapter\s+\d+.*$/i, "");
+  const author = normalize(document.querySelector("#reader-author")?.textContent)
+    .replace(/\s*·\s*Chapter\s+\d+.*$/i, "");
   return `fallback:${title}|${author}`;
 }
 
-function currentChapterIndex() {
+function chapterIndex() {
   return Math.max(0, Number(document.querySelector("#reader-chapter-select")?.value) || 0);
 }
 
-function currentContext() {
-  return {
-    storyKey: currentStoryKey(),
-    chapterIndex: currentChapterIndex(),
-  };
-}
-
-function annotationsForCurrentChapter() {
-  const context = currentContext();
-  return annotationStore.filter(
-    (annotation) =>
-      annotation.storyKey === context.storyKey &&
-      Number(annotation.chapterIndex) === context.chapterIndex,
+function chapterAnnotations() {
+  const key = storyKey();
+  const chapter = chapterIndex();
+  return annotations.filter(
+    (annotation) => annotation.storyKey === key && Number(annotation.chapterIndex) === chapter,
   );
 }
 
-function isIgnoredTextNode(node) {
+function shouldIgnoreTextNode(node) {
   const parent = node.parentElement;
   if (!parent || !node.nodeValue) return true;
   return Boolean(
@@ -75,10 +64,10 @@ function isIgnoredTextNode(node) {
   );
 }
 
-function flattenText(root) {
+function flatten(root) {
   const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
     acceptNode(node) {
-      return isIgnoredTextNode(node) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT;
+      return shouldIgnoreTextNode(node) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT;
     },
   });
 
@@ -93,22 +82,15 @@ function flattenText(root) {
   return { text, nodes };
 }
 
-function boundaryOffset(flat, container, offset, fallbackText, preferEnd = false) {
-  if (container?.nodeType === Node.TEXT_NODE) {
-    const entry = flat.nodes.find((item) => item.node === container);
-    if (entry) return entry.start + Math.min(offset, container.nodeValue.length);
-  }
-
-  const quote = String(fallbackText || "");
-  if (!quote) return 0;
-  const index = preferEnd ? flat.text.lastIndexOf(quote) : flat.text.indexOf(quote);
-  return index < 0 ? 0 : index + (preferEnd ? quote.length : 0);
+function rangeOffset(flat, container, offset) {
+  if (container?.nodeType !== Node.TEXT_NODE) return null;
+  const entry = flat.nodes.find((item) => item.node === container);
+  if (!entry) return null;
+  return entry.start + Math.min(offset, container.nodeValue.length);
 }
 
-function selectionIntersectsHighlight(range) {
-  const root = range.commonAncestorContainer.getRootNode();
-  if (!(root instanceof ShadowRoot)) return false;
-  return [...root.querySelectorAll(`[${HIGHLIGHT_ATTR}]`)].some((mark) => {
+function selectionTouchesExistingHighlight(range, shadow) {
+  return [...shadow.querySelectorAll(`mark[${HIGHLIGHT_ATTR}]`)].some((mark) => {
     try {
       return range.intersectsNode(mark);
     } catch {
@@ -117,40 +99,31 @@ function selectionIntersectsHighlight(range) {
   });
 }
 
-function anchorFromRange(range, workskin) {
+function anchorFromSelection(range, workskin, shadow) {
   const quote = range.toString();
   if (!normalize(quote) || quote.length > 1800) return null;
-  if (selectionIntersectsHighlight(range)) return null;
+  if (selectionTouchesExistingHighlight(range, shadow)) return null;
 
-  const flat = flattenText(workskin);
-  let start = boundaryOffset(flat, range.startContainer, range.startOffset, quote, false);
-  let end = boundaryOffset(flat, range.endContainer, range.endOffset, quote, true);
+  const flat = flatten(workskin);
+  let start = rangeOffset(flat, range.startContainer, range.startOffset);
+  let end = rangeOffset(flat, range.endContainer, range.endOffset);
 
-  if (end <= start || flat.text.slice(start, end) !== quote) {
-    const direct = flat.text.indexOf(quote);
-    if (direct < 0) return null;
-    start = direct;
-    end = direct + quote.length;
+  if (start == null || end == null || end <= start || flat.text.slice(start, end) !== quote) {
+    start = flat.text.indexOf(quote);
+    if (start < 0) return null;
+    end = start + quote.length;
   }
 
-  let occurrence = 0;
-  let cursor = 0;
-  while (cursor < start) {
-    const found = flat.text.indexOf(quote, cursor);
-    if (found < 0 || found >= start) break;
-    occurrence += 1;
-    cursor = found + Math.max(1, quote.length);
-  }
-
+  const matchesBefore = flat.text.slice(0, start).split(quote).length - 1;
   return {
     quote,
     prefix: flat.text.slice(Math.max(0, start - 48), start),
     suffix: flat.text.slice(end, end + 48),
-    occurrence,
+    occurrence: Math.max(0, matchesBefore),
   };
 }
 
-function findAnchorIndex(text, annotation) {
+function findQuote(text, annotation) {
   const quote = String(annotation.quote || "");
   if (!quote) return -1;
 
@@ -167,21 +140,19 @@ function findAnchorIndex(text, annotation) {
   let best = matches[Math.min(annotation.occurrence || 0, matches.length - 1)];
   let bestScore = -1;
   matches.forEach((index) => {
+    const left = text.slice(Math.max(0, index - annotation.prefix.length), index);
+    const right = text.slice(index + quote.length, index + quote.length + annotation.suffix.length);
     let score = 0;
-    if (annotation.prefix) {
-      const left = text.slice(Math.max(0, index - annotation.prefix.length), index);
-      for (let i = 1; i <= Math.min(left.length, annotation.prefix.length); i += 1) {
-        if (left.at(-i) !== annotation.prefix.at(-i)) break;
-        score += 1;
-      }
+
+    for (let i = 1; i <= Math.min(left.length, annotation.prefix.length); i += 1) {
+      if (left.at(-i) !== annotation.prefix.at(-i)) break;
+      score += 1;
     }
-    if (annotation.suffix) {
-      const right = text.slice(index + quote.length, index + quote.length + annotation.suffix.length);
-      for (let i = 0; i < Math.min(right.length, annotation.suffix.length); i += 1) {
-        if (right[i] !== annotation.suffix[i]) break;
-        score += 1;
-      }
+    for (let i = 0; i < Math.min(right.length, annotation.suffix.length); i += 1) {
+      if (right[i] !== annotation.suffix[i]) break;
+      score += 1;
     }
+
     if (score > bestScore) {
       bestScore = score;
       best = index;
@@ -190,35 +161,37 @@ function findAnchorIndex(text, annotation) {
   return best;
 }
 
-function unwrapGeneratedHighlights(root) {
-  root.querySelectorAll(`mark[${HIGHLIGHT_ATTR}]`).forEach((mark) => {
+function unwrapHighlights(workskin) {
+  workskin.querySelectorAll(`mark[${HIGHLIGHT_ATTR}]`).forEach((mark) => {
     mark.replaceWith(...mark.childNodes);
   });
-  root.normalize();
+  workskin.normalize();
 }
 
 function wrapInterval(flat, start, end, annotation) {
-  const overlapping = flat.nodes.filter((entry) => entry.end > start && entry.start < end).reverse();
-  overlapping.forEach((entry) => {
-    const from = Math.max(0, start - entry.start);
-    const to = Math.min(entry.node.nodeValue.length, end - entry.start);
-    if (to <= from || !entry.node.parentNode) return;
+  flat.nodes
+    .filter((entry) => entry.end > start && entry.start < end)
+    .reverse()
+    .forEach((entry) => {
+      if (!entry.node.parentNode) return;
+      const from = Math.max(0, start - entry.start);
+      const to = Math.min(entry.node.nodeValue.length, end - entry.start);
+      if (to <= from) return;
 
-    const range = document.createRange();
-    range.setStart(entry.node, from);
-    range.setEnd(entry.node, to);
-    const mark = document.createElement("mark");
-    mark.setAttribute(HIGHLIGHT_ATTR, annotation.id);
-    if (annotation.note) mark.dataset.homeslopHasNote = "true";
-    try {
-      range.surroundContents(mark);
-    } catch {
-      return;
-    }
-  });
+      const range = document.createRange();
+      range.setStart(entry.node, from);
+      range.setEnd(entry.node, to);
+      const mark = document.createElement("mark");
+      mark.setAttribute(HIGHLIGHT_ATTR, annotation.id);
+      try {
+        range.surroundContents(mark);
+      } catch {
+        return;
+      }
+    });
 }
 
-function installAnnotationStyles(shadow) {
+function installShadowStyles(shadow) {
   if (shadow.querySelector("#homeslop-annotation-style")) return;
   const style = document.createElement("style");
   style.id = "homeslop-annotation-style";
@@ -254,21 +227,26 @@ function installAnnotationStyles(shadow) {
   shadow.append(style);
 }
 
+function observeShadow(shadow) {
+  shadowObserver?.disconnect();
+  shadowObserver = new MutationObserver(scheduleRender);
+  shadowObserver.observe(shadow, { childList: true, subtree: true });
+}
+
 function renderAnnotations() {
-  annotationFrame = 0;
-  if (renderingAnnotations) return;
+  renderFrame = 0;
   const shadow = document.querySelector("#reader-shadow")?.shadowRoot;
   const workskin = shadow?.querySelector("#workskin");
   if (!shadow || !workskin) return;
 
-  renderingAnnotations = true;
+  shadowObserver?.disconnect();
   try {
-    installAnnotationStyles(shadow);
-    unwrapGeneratedHighlights(workskin);
-    const flat = flattenText(workskin);
-    const intervals = annotationsForCurrentChapter()
+    installShadowStyles(shadow);
+    unwrapHighlights(workskin);
+    const flat = flatten(workskin);
+    const located = chapterAnnotations()
       .map((annotation) => {
-        const start = findAnchorIndex(flat.text, annotation);
+        const start = findQuote(flat.text, annotation);
         return start < 0 ? null : { annotation, start, end: start + annotation.quote.length };
       })
       .filter(Boolean)
@@ -276,33 +254,31 @@ function renderAnnotations() {
 
     const accepted = [];
     let occupiedUntil = -1;
-    intervals.forEach((interval) => {
-      if (interval.start < occupiedUntil) return;
-      accepted.push(interval);
-      occupiedUntil = interval.end;
+    located.forEach((item) => {
+      if (item.start < occupiedUntil) return;
+      accepted.push(item);
+      occupiedUntil = item.end;
     });
 
-    [...accepted].reverse().forEach((interval) => {
-      wrapInterval(flat, interval.start, interval.end, interval.annotation);
+    [...accepted].reverse().forEach((item) => {
+      wrapInterval(flat, item.start, item.end, item.annotation);
     });
 
     accepted.forEach(({ annotation }) => {
+      if (!annotation.note) return;
       const fragments = workskin.querySelectorAll(
         `mark[${HIGHLIGHT_ATTR}="${CSS.escape(annotation.id)}"]`,
       );
-      if (annotation.note && fragments.length) {
-        fragments[fragments.length - 1].setAttribute(NOTE_PIN_ATTR, "");
-      }
+      fragments[fragments.length - 1]?.setAttribute(NOTE_PIN_ATTR, "");
     });
   } finally {
-    renderingAnnotations = false;
+    observeShadow(shadow);
   }
 }
 
-function scheduleAnnotationRender() {
-  if (renderingAnnotations) return;
-  if (annotationFrame) cancelAnimationFrame(annotationFrame);
-  annotationFrame = requestAnimationFrame(renderAnnotations);
+function scheduleRender() {
+  if (renderFrame) cancelAnimationFrame(renderFrame);
+  renderFrame = requestAnimationFrame(renderAnnotations);
 }
 
 function installMainStyles() {
@@ -335,7 +311,12 @@ function installMainStyles() {
       background: #303030;
       font: 700 .72rem/1 "Courier New", monospace;
     }
-    #${TOOLBAR_ID} .annotation-primary { color: #171717; background: #ffd83d; border-color: #c8a500; }
+    #${TOOLBAR_ID} .annotation-primary,
+    #${EDITOR_ID} .annotation-save {
+      color: #171717;
+      background: #ffd83d;
+      border-color: #c8a500;
+    }
     #${EDITOR_ID} {
       position: fixed;
       left: max(.6rem, env(safe-area-inset-left));
@@ -378,13 +359,12 @@ function installMainStyles() {
       font: 1rem/1.45 "Lucida Grande", Verdana, sans-serif;
     }
     #${EDITOR_ID} .annotation-actions { display: flex; gap: .4rem; margin-top: .55rem; }
-    #${EDITOR_ID} .annotation-save { color: #171717; background: #ffd83d; border-color: #c8a500; }
     #${EDITOR_ID} .annotation-delete { margin-left: auto; color: #ff9bac; }
   `;
   document.head.append(style);
 }
 
-function ensureSelectionToolbar() {
+function ensureToolbar() {
   let toolbar = document.getElementById(TOOLBAR_ID);
   if (toolbar) return toolbar;
   installMainStyles();
@@ -397,10 +377,9 @@ function ensureSelectionToolbar() {
     <button type="button" data-action="cancel" aria-label="Cancel">×</button>
   `;
   document.body.append(toolbar);
-
   toolbar.querySelector('[data-action="highlight"]').addEventListener("click", () => createAnnotation(false));
   toolbar.querySelector('[data-action="note"]').addEventListener("click", () => createAnnotation(true));
-  toolbar.querySelector('[data-action="cancel"]').addEventListener("click", hideSelectionToolbar);
+  toolbar.querySelector('[data-action="cancel"]').addEventListener("click", hideToolbar);
   return toolbar;
 }
 
@@ -421,16 +400,14 @@ function ensureEditor() {
     </div>
   `;
   document.body.append(editor);
-
-  editor.querySelector(".annotation-save").addEventListener("click", saveEditorNote);
+  editor.querySelector(".annotation-save").addEventListener("click", saveNote);
   editor.querySelector(".annotation-close").addEventListener("click", closeEditor);
-  editor.querySelector(".annotation-delete").addEventListener("click", deleteActiveAnnotation);
+  editor.querySelector(".annotation-delete").addEventListener("click", deleteAnnotation);
   return editor;
 }
 
-function hideSelectionToolbar() {
-  const toolbar = document.getElementById(TOOLBAR_ID);
-  if (toolbar) toolbar.dataset.open = "false";
+function hideToolbar() {
+  document.getElementById(TOOLBAR_ID)?.setAttribute("data-open", "false");
   pendingAnchor = null;
 }
 
@@ -442,33 +419,32 @@ function clearSelection() {
 
 function createAnnotation(withNote) {
   if (!pendingAnchor) return;
-  const context = currentContext();
   const annotation = {
     id: crypto.randomUUID(),
-    storyKey: context.storyKey,
-    chapterIndex: context.chapterIndex,
+    storyKey: storyKey(),
+    chapterIndex: chapterIndex(),
     ...pendingAnchor,
     note: "",
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   };
-  annotationStore.push(annotation);
-  saveAnnotations();
-  hideSelectionToolbar();
+  annotations.push(annotation);
+  persistAnnotations();
+  hideToolbar();
   clearSelection();
-  scheduleAnnotationRender();
-  if (withNote) window.setTimeout(() => openEditor(annotation.id), 80);
+  scheduleRender();
+  if (withNote) setTimeout(() => openEditor(annotation.id), 80);
 }
 
 function openEditor(id) {
-  const annotation = annotationStore.find((item) => item.id === id);
+  const annotation = annotations.find((item) => item.id === id);
   if (!annotation) return;
   const editor = ensureEditor();
   activeAnnotationId = id;
   editor.querySelector(".annotation-quote").textContent = annotation.quote;
   editor.querySelector("textarea").value = annotation.note || "";
   editor.dataset.open = "true";
-  window.setTimeout(() => editor.querySelector("textarea").focus(), 80);
+  setTimeout(() => editor.querySelector("textarea").focus(), 80);
 }
 
 function closeEditor() {
@@ -477,32 +453,24 @@ function closeEditor() {
   activeAnnotationId = null;
 }
 
-function saveEditorNote() {
-  const annotation = annotationStore.find((item) => item.id === activeAnnotationId);
+function saveNote() {
   const editor = document.getElementById(EDITOR_ID);
-  if (!annotation || !editor) return;
+  const annotation = annotations.find((item) => item.id === activeAnnotationId);
+  if (!editor || !annotation) return;
   annotation.note = editor.querySelector("textarea").value.trim();
   annotation.updatedAt = new Date().toISOString();
-  saveAnnotations();
+  persistAnnotations();
   closeEditor();
-  scheduleAnnotationRender();
+  scheduleRender();
 }
 
-function deleteActiveAnnotation() {
-  const annotation = annotationStore.find((item) => item.id === activeAnnotationId);
-  if (!annotation) return;
+function deleteAnnotation() {
+  if (!activeAnnotationId) return;
   if (!window.confirm("Delete this highlight and its note?")) return;
-  annotationStore = annotationStore.filter((item) => item.id !== activeAnnotationId);
-  saveAnnotations();
+  annotations = annotations.filter((item) => item.id !== activeAnnotationId);
+  persistAnnotations();
   closeEditor();
-  scheduleAnnotationRender();
-}
-
-function selectionForShadow(shadow) {
-  const shadowSelection = shadow.getSelection?.();
-  if (shadowSelection?.rangeCount) return shadowSelection;
-  const documentSelection = document.getSelection();
-  return documentSelection?.rangeCount ? documentSelection : null;
+  scheduleRender();
 }
 
 function inspectSelection() {
@@ -510,60 +478,66 @@ function inspectSelection() {
   const workskin = shadow?.querySelector("#workskin");
   if (!shadow || !workskin) return;
 
-  const selection = selectionForShadow(shadow);
-  if (!selection || selection.isCollapsed || !normalize(selection.toString())) {
-    hideSelectionToolbar();
+  const selection = shadow.getSelection?.()?.rangeCount
+    ? shadow.getSelection()
+    : document.getSelection();
+  if (!selection?.rangeCount || selection.isCollapsed || !normalize(selection.toString())) {
+    hideToolbar();
     return;
   }
 
   const range = selection.getRangeAt(0);
   if (range.commonAncestorContainer.getRootNode() !== shadow) return;
-  if (!workskin.contains(range.commonAncestorContainer.nodeType === Node.ELEMENT_NODE
+  const container = range.commonAncestorContainer.nodeType === Node.ELEMENT_NODE
     ? range.commonAncestorContainer
-    : range.commonAncestorContainer.parentElement)) return;
+    : range.commonAncestorContainer.parentElement;
+  if (!workskin.contains(container)) return;
 
-  const anchor = anchorFromRange(range, workskin);
+  const anchor = anchorFromSelection(range, workskin, shadow);
   if (!anchor) {
-    hideSelectionToolbar();
+    hideToolbar();
     return;
   }
+
   pendingAnchor = anchor;
-  ensureSelectionToolbar().dataset.open = "true";
+  ensureToolbar().dataset.open = "true";
 }
 
-function scheduleSelectionInspection(delay = 260) {
+function scheduleSelectionInspection(delay = 280) {
   clearTimeout(selectionTimer);
-  selectionTimer = window.setTimeout(inspectSelection, delay);
+  selectionTimer = setTimeout(inspectSelection, delay);
 }
 
-function connectAnnotations() {
+function connectToShadow() {
   const shadow = document.querySelector("#reader-shadow")?.shadowRoot;
   if (!shadow) return false;
+  if (currentShadow === shadow) {
+    scheduleRender();
+    return true;
+  }
 
-  installAnnotationStyles(shadow);
-  annotationObserver?.disconnect();
-  annotationObserver = new MutationObserver(scheduleAnnotationRender);
-  annotationObserver.observe(shadow, { childList: true, subtree: true });
-
+  currentShadow = shadow;
+  installShadowStyles(shadow);
+  observeShadow(shadow);
   shadow.addEventListener("pointerup", () => scheduleSelectionInspection(300));
   shadow.addEventListener("keyup", () => scheduleSelectionInspection(80));
   shadow.addEventListener("click", (event) => {
     const mark = event.target.closest?.(`mark[${HIGHLIGHT_ATTR}]`);
     if (mark) openEditor(mark.getAttribute(HIGHLIGHT_ATTR));
   });
-  scheduleAnnotationRender();
+  scheduleRender();
   return true;
 }
 
-function connectAnnotationsWhenReady() {
-  if (connectAnnotations()) {
-    annotationShellObserver?.disconnect();
-    annotationShellObserver = null;
+function connectWhenReady() {
+  if (connectToShadow()) {
+    shellObserver?.disconnect();
+    shellObserver = null;
     return;
   }
-  if (annotationShellObserver) return;
-  annotationShellObserver = new MutationObserver(connectAnnotationsWhenReady);
-  annotationShellObserver.observe(document.body, { childList: true, subtree: true });
+  if (shellObserver) return;
+  shellObserver = new MutationObserver(connectWhenReady);
+  shellObserver.observe(document.body, { childList: true, subtree: true });
 }
 
 document.addEventListener("selectionchange", () => scheduleSelectionInspection(320));
@@ -576,13 +550,13 @@ document.addEventListener(
   true,
 );
 document.querySelector("#reader-chapter-select")?.addEventListener("change", () => {
-  hideSelectionToolbar();
+  hideToolbar();
   closeEditor();
-  window.setTimeout(scheduleAnnotationRender, 120);
+  setTimeout(scheduleRender, 120);
 });
 document.querySelector("#reader-back")?.addEventListener("click", () => {
-  hideSelectionToolbar();
+  hideToolbar();
   closeEditor();
 });
 
-connectAnnotationsWhenReady();
+connectWhenReady();
